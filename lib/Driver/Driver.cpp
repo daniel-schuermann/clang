@@ -37,6 +37,7 @@
 #include "ToolChains/OpenBSD.h"
 #include "ToolChains/PS4CPU.h"
 #include "ToolChains/Solaris.h"
+#include "ToolChains/SPIR.h"
 #include "ToolChains/TCE.h"
 #include "ToolChains/WebAssembly.h"
 #include "ToolChains/XCore.h"
@@ -3924,6 +3925,10 @@ const ToolChain &Driver::getToolChain(const ArgList &Args,
         break;
       case llvm::Triple::avr:
         TC = llvm::make_unique<toolchains::AVRToolChain>(*this, Target, Args);
+        break;
+      case llvm::Triple::spir:
+      case llvm::Triple::spir64:
+        TC = llvm::make_unique<toolchains::SPIRToolChain>(*this, Target, Args);
         break;
       default:
         if (Target.getVendor() == llvm::Triple::Myriad)
