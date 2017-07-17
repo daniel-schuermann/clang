@@ -21,6 +21,7 @@
 #include "CGOpenCLRuntime.h"
 #include "CGOpenMPRuntime.h"
 #include "CGOpenMPRuntimeNVPTX.h"
+#include "CGOpenMPRuntimeSPIR.h"
 #include "CodeGenFunction.h"
 #include "CodeGenPGO.h"
 #include "ConstantEmitter.h"
@@ -205,6 +206,12 @@ void CodeGenModule::createOpenMPRuntime() {
     assert(getLangOpts().OpenMPIsDevice &&
            "OpenMP NVPTX is only prepared to deal with device code.");
     OpenMPRuntime.reset(new CGOpenMPRuntimeNVPTX(*this));
+    break;
+  case llvm::Triple::spir:
+  case llvm::Triple::spir64:
+    assert(getLangOpts().OpenMPIsDevice &&
+           "OpenMP SPIR is only prepared to deal with device code.");
+    OpenMPRuntime.reset(new CGOpenMPRuntimeSPIR(*this));
     break;
   default:
     OpenMPRuntime.reset(new CGOpenMPRuntime(*this));
