@@ -31,7 +31,8 @@ protected:
         get_local_id,
         get_local_size,
         get_num_groups,
-        get_group_id
+        get_group_id,
+        work_group_barrier
     };
     QualType getAddrSpaceType(QualType T, LangAS::ID AddrSpace);
     llvm::Constant *createRuntimeFunction(OpenMPRTLFunctionSPIR Function);
@@ -106,6 +107,26 @@ public:
     void emitTeamsCall(CodeGenFunction &CGF, const OMPExecutableDirective &D,
                        SourceLocation Loc, llvm::Value *OutlinedFn,
                        ArrayRef<llvm::Value *> CapturedVars) override;
+
+    /// \brief Emits a master region.
+    /// \param MasterOpGen Generator for the statement associated with the given
+    /// master region.
+    virtual void emitMasterRegion(CodeGenFunction &CGF,
+                                  const RegionCodeGenTy &MasterOpGen,
+                                  SourceLocation Loc);
+
+    /// \brief Emit an implicit/explicit barrier for OpenMP threads.
+    /// \param Kind Directive for which this implicit barrier call must be
+    /// generated. Must be OMPD_barrier for explicit barrier generation.
+    /// \param EmitChecks true if need to emit checks for cancellation barriers.
+    /// \param ForceSimpleCall true simple barrier call must be emitted, false if
+    /// runtime class decides which one to emit (simple or with cancellation
+    /// checks).
+    ///
+    virtual void emitBarrierCall(CodeGenFunction &CGF, SourceLocation Loc,
+                                 OpenMPDirectiveKind Kind,
+                                 bool EmitChecks = true,
+                                 bool ForceSimpleCall = false);
 
     /// \brief Call the appropriate runtime routine to initialize it before start
     /// of loop.

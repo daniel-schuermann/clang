@@ -50,6 +50,10 @@ llvm::Constant * CGOpenMPRuntimeSPIR::createRuntimeFunction(OpenMPRTLFunctionSPI
     case get_group_id: {
       return CGM.CreateRuntimeFunction(llvm::FunctionType::get(CGM.SizeTy, param, false), "_Z12get_group_idj");
     }
+    case work_group_barrier: {
+      //CLK_GLOBAL_MEM_FENCE   0x02
+      return CGM.CreateRuntimeFunction(llvm::FunctionType::get(CGM.VoidTy, param, false), "_Z18work_group_barrierj");
+    }
     default:
       return nullptr;
   }
@@ -457,6 +461,39 @@ void CGOpenMPRuntimeSPIR::emitTeamsCall(CodeGenFunction &CGF,
   OutlinedFnArgs.push_back(local_tid.getPointer()); // TODO: bound_tid
   OutlinedFnArgs.append(CapturedVars.begin(), CapturedVars.end());
   CGF.EmitCallOrInvoke(OutlinedFn, OutlinedFnArgs);
+}
+
+void CGOpenMPRuntimeSPIR::emitMasterRegion(CodeGenFunction &CGF,
+                                       const RegionCodeGenTy &MasterOpGen,
+                                       SourceLocation Loc) {
+  if (!CGF.HaveInsertPoint())
+    return;
+
+  // principle: if(threadID == 0):
+  llvm::Value * arg[] = { CGF.Builder.getInt32(0) };
+  llvm::CallInst * ltid = CGF.EmitRuntimeCall(createRuntimeFunction(get_local_id), arg);
+  llvm::Value * ltid_casted = CGF.Builder.CreateTruncOrBitCast(ltid, CGF.Int32Ty);
+  llvm::Value * cond = CGF.Builder.CreateIsNull(ltid_casted);
+  llvm::BasicBlock * ThenBlock = CGF.createBasicBlock("omp_if.then");
+  llvm::BasicBlock * ContBlock = CGF.createBasicBlock("omp_if.end");
+  // Generate the branch (If-stmt)
+  CGF.Builder.CreateCondBr(cond, ThenBlock, ContBlock);
+  CGF.EmitBlock(ThenBlock);
+
+  emitInlinedDirective(CGF, OMPD_master, MasterOpGen);
+  CGF.EmitBranch(ContBlock);
+  CGF.EmitBlock(ContBlock, true);
+}
+
+void CGOpenMPRuntimeSPIR::emitBarrierCall(CodeGenFunction &CGF, SourceLocation Loc,
+                                      OpenMPDirectiveKind Kind, bool EmitChecks,
+                                      bool ForceSimpleCall) {
+  if (!CGF.HaveInsertPoint())
+    return;
+
+  // call opencl work group barrier
+  llvm::Value * arg[] = { CGF.Builder.getInt32(1 << 1) }; //CLK_GLOBAL_MEM_FENCE   0x02
+  CGF.EmitRuntimeCall(createRuntimeFunction(work_group_barrier), arg);
 }
 
 void CGOpenMPRuntimeSPIR::emitForStaticInit(CodeGenFunction &CGF,
