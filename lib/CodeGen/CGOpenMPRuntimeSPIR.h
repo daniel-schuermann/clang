@@ -17,6 +17,7 @@
 
 #include "CGOpenMPRuntime.h"
 #include "CodeGenFunction.h"
+#include "clang/Basic/IdentifierTable.h"
 #include "clang/AST/StmtOpenMP.h"
 #include "llvm/IR/CallSite.h"
 
@@ -36,13 +37,19 @@ protected:
   };
   // TODO: comment these functions!
   QualType getAddrSpaceType(QualType T, LangAS::ID AddrSpace);
+  bool isGlobal(IdentifierInfo * info);
+  SmallVector<IdentifierInfo *, 16> captures;
   llvm::BasicBlock * MasterContBlock;
+  llvm::BasicBlock * NumThreadsContBlock;
   void emitMasterHeader(CodeGenFunction &CGF);
   void emitMasterFooter(CodeGenFunction &CGF);
+  void emitNumThreadsHeader(CodeGenFunction &CGF, llvm::Value *NumThreads);
+  void emitNumThreadsFooter(CodeGenFunction &CGF);
   void GenOpenCLArgMetadata(const RecordDecl *FD, llvm::Function *Fn, llvm::LLVMContext &Context, CGBuilderTy &Builder);
   llvm::Constant *createRuntimeFunction(OpenMPRTLFunctionSPIR Function);
   void setTargetParallel(OpenMPDirectiveKind kind);
   bool isTargetParallel;
+  bool inParallel;
 
 public:
   explicit CGOpenMPRuntimeSPIR(CodeGenModule &CGM);
@@ -204,6 +211,22 @@ public:
                                    const OpenMPScheduleTy &ScheduleKind,
                                    unsigned IVSize, bool IVSigned, bool Ordered,
                                    const DispatchRTInput &DispatchValues);
+
+  /// \brief Emits call to void __kmpc_push_num_threads(ident_t *loc, kmp_int32
+  /// global_tid, kmp_int32 num_threads) to generate code for 'num_threads'
+  /// clause.
+  /// \param NumThreads An integer value of threads.
+  virtual void emitNumThreadsClause(CodeGenFunction &CGF,
+                                    llvm::Value *NumThreads,
+                                    SourceLocation Loc);
+
+  /// \brief Emits call to void __kmpc_push_num_teams(ident_t *loc, kmp_int32
+  /// global_tid, kmp_int32 num_teams, kmp_int32 thread_limit) to generate code
+  /// for num_teams clause.
+  /// \param NumTeams An integer expression of teams.
+  /// \param ThreadLimit An integer expression of threads.
+  virtual void emitNumTeamsClause(CodeGenFunction &CGF, const Expr *NumTeams,
+                                  const Expr *ThreadLimit, SourceLocation Loc);
 
   /// \brief Check if the specified \a ScheduleKind is static non-chunked.
   /// This kind of worksharing directive is emitted without outer loop.

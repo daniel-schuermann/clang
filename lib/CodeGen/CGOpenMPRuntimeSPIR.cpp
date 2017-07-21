@@ -21,11 +21,12 @@ using namespace CodeGen;
 CGOpenMPRuntimeSPIR::CGOpenMPRuntimeSPIR(CodeGenModule &CGM)
         : CGOpenMPRuntime(CGM) {
   MasterContBlock = nullptr;
+  NumThreadsContBlock = nullptr;
+  inParallel = false;
   std::cout << "using SPIR\n";
   if (!CGM.getLangOpts().OpenMPIsDevice)
     llvm_unreachable("OpenMP SPIR can only handle device code.");
   std::cout << std::string(CGM.getDataLayout().getStringRepresentation()) << "\n";
-
 }
 
 llvm::Constant * CGOpenMPRuntimeSPIR::createRuntimeFunction(OpenMPRTLFunctionSPIR Function) {
@@ -57,11 +58,20 @@ llvm::Constant * CGOpenMPRuntimeSPIR::createRuntimeFunction(OpenMPRTLFunctionSPI
 
 // Get the same Type in a given Address Space
 QualType CGOpenMPRuntimeSPIR::getAddrSpaceType(QualType T, LangAS::ID AddrSpace) {
-  if(T.getTypePtr()->isAnyPointerType() || T.getTypePtr()->isLValueReferenceType()) {
+  if(T.getTypePtr()->isLValueReferenceType())
+    return CGM.getContext().getLValueReferenceType(getAddrSpaceType(T.getTypePtr()->getPointeeType(), AddrSpace), true);
+  if(T.getTypePtr()->isAnyPointerType())
     return CGM.getContext().getPointerType(getAddrSpaceType(T.getTypePtr()->getPointeeType(), AddrSpace));
-  } else {
+  if(T.getTypePtr()->isBuiltinType())
     return CGM.getContext().getAddrSpaceQualType(T, AddrSpace);
+  return T;
+}
+
+bool CGOpenMPRuntimeSPIR::isGlobal(IdentifierInfo * info) {
+  for(IdentifierInfo * capture : captures) {
+    if(capture == info) return true;
   }
+  return false;
 }
 
 void CGOpenMPRuntimeSPIR::emitMasterHeader(CodeGenFunction &CGF) {
@@ -85,6 +95,30 @@ void CGOpenMPRuntimeSPIR::emitMasterFooter(CodeGenFunction &CGF) {
   CGF.EmitBranch(MasterContBlock);
   CGF.EmitBlock(MasterContBlock, true);
   MasterContBlock = nullptr;
+  return;
+}
+
+void CGOpenMPRuntimeSPIR::emitNumThreadsHeader(CodeGenFunction &CGF, llvm::Value *NumThreads) {
+  assert(NumThreadsContBlock == nullptr);
+  llvm::Value *arg[] = {CGF.Builder.getInt32(0)};
+  llvm::CallInst *ltid = CGF.EmitRuntimeCall(createRuntimeFunction(get_local_id), arg);
+  llvm::Value *ltid_casted = CGF.Builder.CreateTruncOrBitCast(ltid, CGF.Int32Ty);
+  llvm::Value *cond = CGF.Builder.CreateICmpSLT(ltid_casted, NumThreads);
+  llvm::BasicBlock *ThenBlock = CGF.createBasicBlock("omp_if.then");
+  NumThreadsContBlock = CGF.createBasicBlock("omp_if.end");
+  // Generate the branch (If-stmt)
+  CGF.Builder.CreateCondBr(cond, ThenBlock, NumThreadsContBlock);
+  CGF.EmitBlock(ThenBlock);
+  return;
+}
+
+void CGOpenMPRuntimeSPIR::emitNumThreadsFooter(CodeGenFunction &CGF) {
+  // only close num_threads region, if there is one
+  if(NumThreadsContBlock == nullptr)
+    return;
+  CGF.EmitBranch(NumThreadsContBlock);
+  CGF.EmitBlock(NumThreadsContBlock, true);
+  NumThreadsContBlock = nullptr;
   return;
 }
 
@@ -287,6 +321,7 @@ void CGOpenMPRuntimeSPIR::emitTargetOutlinedFunction(
       // TODO: are we sure to always have a Pointer here?
       QualType ArgType = FD->getType();
       FD->setType(getAddrSpaceType(ArgType, LangAS::opencl_global));
+      captures.push_back(I->getCapturedVar()->getIdentifier());
       ++I;
     }
 
@@ -313,7 +348,6 @@ void CGOpenMPRuntimeSPIR::emitTargetOutlinedFunction(
   OutlinedFn->setCallingConv(llvm::CallingConv::SPIR_KERNEL);
   OutlinedFn->addFnAttr(llvm::Attribute::NoUnwind);
   OutlinedFn->removeFnAttr(llvm::Attribute::OptimizeNone);
-  OutlinedFn->dump();
 
   CodeGenFunction CGF(CGM);
   GenOpenCLArgMetadata(CS.getCapturedRecordDecl(), OutlinedFn,
@@ -327,12 +361,23 @@ llvm::Value *CGOpenMPRuntimeSPIR::emitParallelOutlinedFunction(
   const CapturedStmt *CS = D.getCapturedStmt(OMPD_parallel);
 
   const RecordDecl *RD = CS->getCapturedRecordDecl();
-  for (auto *FD : RD->fields()) {
-    FD->setType(getAddrSpaceType(FD->getType(), LangAS::opencl_global));
+  auto I = CS->captures().begin();
+  for (FieldDecl *FD : RD->fields()) {
+    if(isGlobal(I->getCapturedVar()->getIdentifier())) {
+      FD->setType(getAddrSpaceType(FD->getType(), LangAS::opencl_global));
+    }
+    ++I;
   }
   std::cout << "emit parallel outlined function\n";
+  bool wasAlreadyParallel = inParallel;
+  inParallel = true;
   llvm::Value *OutlinedFn = CGOpenMPRuntime::emitParallelOutlinedFunction(D, ThreadIDVar, InnermostKind, CodeGen);
-  OutlinedFn->dump();
+  inParallel = wasAlreadyParallel;
+  if (auto Fn = dyn_cast<llvm::Function>(OutlinedFn)) {
+    Fn->removeFnAttr(llvm::Attribute::NoInline);
+    Fn->removeFnAttr(llvm::Attribute::OptimizeNone);
+    Fn->addFnAttr(llvm::Attribute::AlwaysInline);
+  }
   return OutlinedFn;
 }
 
@@ -340,38 +385,63 @@ void CGOpenMPRuntimeSPIR::emitParallelCall(CodeGenFunction &CGF, SourceLocation 
                                        llvm::Value *OutlinedFn,
                                        ArrayRef<llvm::Value *> CapturedVars,
                                        const Expr *IfCond) {
-
   if (!CGF.HaveInsertPoint())
     return;
 
-  if (auto Fn = dyn_cast<llvm::Function>(OutlinedFn)) {
-    Fn->removeFnAttr(llvm::Attribute::NoInline);
-    Fn->removeFnAttr(llvm::Attribute::OptimizeNone);
-    Fn->addFnAttr(llvm::Attribute::AlwaysInline);
-    Fn->addFnAttr(llvm::Attribute::OptimizeForSize); //TODO try?
-  }
-  std::cout << "emit parallel master footer\n";
-  emitMasterFooter(CGF);
-  // TODO: Better remove these unnecessary arguments?
-  llvm::Value * arg[] = { CGF.Builder.getInt32(0) };
-  llvm::CallInst * gtid = CGF.EmitRuntimeCall(createRuntimeFunction(get_global_id), arg);
-  Address global_tid = CGF.CreateTempAlloca(CGF.Int32Ty, CharUnits::fromQuantity(4), ".gtid");
-  llvm::Value * gtid_casted = CGF.Builder.CreateTruncOrBitCast(gtid, CGF.Int32Ty);
-  CGF.EmitStoreOfScalar(gtid_casted, CGF.MakeAddrLValue(global_tid, CGF.getContext().getIntPtrType()), true);
+  // TODO: clean up this mess :)
+  if(inParallel) {
 
-  llvm::CallInst * ltid = CGF.EmitRuntimeCall(createRuntimeFunction(get_local_id), arg);
-  Address local_tid = CGF.CreateTempAlloca(CGF.Int32Ty, CharUnits::fromQuantity(4), ".btid");
-  llvm::Value * ltid_casted = CGF.Builder.CreateTruncOrBitCast(ltid, CGF.Int32Ty);
-  CGF.EmitStoreOfScalar(ltid_casted, CGF.MakeAddrLValue(local_tid, CGF.getContext().getIntPtrType()), true);
+    std::cout << "call inner parallel function\n";
 
-  llvm::SmallVector<llvm::Value *, 16> OutlinedFnArgs;
-  OutlinedFnArgs.push_back(global_tid.getPointer()); // global_tid
-  OutlinedFnArgs.push_back(local_tid.getPointer());  // bound_tid
-  OutlinedFnArgs.append(CapturedVars.begin(), CapturedVars.end());
+    auto &&ThenGen = [OutlinedFn, CapturedVars, this](CodeGenFunction &CGF,
+                                                       PrePostActionTy &) {
+        llvm::SmallVector<llvm::Value *, 16> RealArgs;
+        RealArgs.push_back(
+                llvm::ConstantPointerNull::get(CGF.CGM.Int32Ty->getPointerTo()));
+        RealArgs.push_back(
+                llvm::ConstantPointerNull::get(CGF.CGM.Int32Ty->getPointerTo()));
+        RealArgs.append(CapturedVars.begin(), CapturedVars.end());
+
+        CGF.EmitCallOrInvoke(OutlinedFn, RealArgs);
+        if(this->NumThreadsContBlock)
+          this->emitNumThreadsFooter(CGF);
+    };
+    RegionCodeGenTy ThenRCG(ThenGen);
+    ThenRCG(CGF);
+
+  }else {
+    auto &&ThenGen = [OutlinedFn, CapturedVars, this](CodeGenFunction &CGF,
+                                                      PrePostActionTy &) {
+    emitMasterFooter(CGF);
+    // TODO: Better remove these unnecessary arguments?
+    llvm::Value *arg[] = {CGF.Builder.getInt32(0)};
+    llvm::CallInst *gtid = CGF.EmitRuntimeCall(this->createRuntimeFunction(get_global_id), arg);
+    Address global_tid = CGF.CreateTempAlloca(CGF.Int32Ty, CharUnits::fromQuantity(4), ".gtid");
+    llvm::Value *gtid_casted = CGF.Builder.CreateTruncOrBitCast(gtid, CGF.Int32Ty);
+    CGF.EmitStoreOfScalar(gtid_casted, CGF.MakeAddrLValue(global_tid, CGF.getContext().getIntPtrType()), true);
+
+    llvm::CallInst *ltid = CGF.EmitRuntimeCall(this->createRuntimeFunction(get_local_id), arg);
+    Address local_tid = CGF.CreateTempAlloca(CGF.Int32Ty, CharUnits::fromQuantity(4), ".btid");
+    llvm::Value *ltid_casted = CGF.Builder.CreateTruncOrBitCast(ltid, CGF.Int32Ty);
+    CGF.EmitStoreOfScalar(ltid_casted, CGF.MakeAddrLValue(local_tid, CGF.getContext().getIntPtrType()), true);
+
+        llvm::SmallVector<llvm::Value *, 16> OutlinedFnArgs;
+
+        OutlinedFnArgs.push_back(global_tid.getPointer()); // global_tid
+    OutlinedFnArgs.push_back(local_tid.getPointer());  // bound_tid
+    OutlinedFnArgs.append(CapturedVars.begin(), CapturedVars.end());
+
+  for(auto arg : OutlinedFnArgs) arg->dump();
   CGF.EmitCallOrInvoke(OutlinedFn, OutlinedFnArgs);
-  std::cout << "emit parallel master header\n";
-  if(!isTargetParallel) // TODO: we could leave that in and let the optimizer do this for us
-    emitMasterHeader(CGF);
+
+  if(this->NumThreadsContBlock)
+    this->emitNumThreadsFooter(CGF); // close num_threads clause, if there is one
+  if(!this->isTargetParallel && !this->inParallel) // TODO: we could leave that in and let the optimizer do this for us
+    this->emitMasterHeader(CGF);
+    };
+    RegionCodeGenTy ThenRCG(ThenGen);
+    ThenRCG(CGF);
+  }
 }
 
 
@@ -569,6 +639,22 @@ void CGOpenMPRuntimeSPIR::emitDistributeStaticInit(
 
 void CGOpenMPRuntimeSPIR::emitForStaticFinish(CodeGenFunction &CGF,
                                           SourceLocation Loc) {}
+
+void CGOpenMPRuntimeSPIR::emitNumThreadsClause(CodeGenFunction &CGF,
+                                           llvm::Value *NumThreads,
+                                           SourceLocation Loc) {
+  // only emit this clause if it is the outermost parallel construct
+  if(inParallel)
+    return;
+  // principle: if(thread_id < NumThreads) {...}
+  emitNumThreadsHeader(CGF, NumThreads);
+  // Footer must be emitted by end of parallel region
+}
+
+void CGOpenMPRuntimeSPIR::emitNumTeamsClause(CodeGenFunction &CGF,
+                                         const Expr *NumTeams,
+                                         const Expr *ThreadLimit,
+                                         SourceLocation Loc) {}
 
 void CGOpenMPRuntimeSPIR::emitForDispatchInit(
         CodeGenFunction &CGF, SourceLocation Loc,
