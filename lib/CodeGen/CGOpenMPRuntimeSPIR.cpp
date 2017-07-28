@@ -18,11 +18,43 @@
 using namespace clang;
 using namespace CodeGen;
 
+
+/// \brief RAII for emitting code of OpenMP constructs.
+class OutlinedFunctionRAII {
+  CGOpenMPRuntimeSPIR &RT;
+  CodeGenModule &CGM;
+  llvm::BasicBlock * oldMCB;
+  unsigned oldAddrSpace;
+
+public:
+  OutlinedFunctionRAII(CGOpenMPRuntimeSPIR &RT, CodeGenModule &CGM, CGOpenMPRuntimeSPIR::AllocaAddrSpace AddrSpace)
+    : RT(RT), CGM(CGM), oldMCB(RT.MasterContBlock), oldAddrSpace(CGM.ASTAllocaAddressSpace) {
+    // FIXME: allocaaddrspace is ignored. reset Datalayout to: e-p${AddrSpace}:64:64:....
+    CGM.ASTAllocaAddressSpace = (unsigned) AddrSpace;
+    const std::string &dl =CGM.getDataLayout().getStringRepresentation();
+    std::string newDL = "e-p" + std::to_string(AddrSpace) + dl.substr(3);
+    std::cout << newDL << "\n";
+
+    //CGM.getDataLayout().reset(StringRef(newDL));
+    RT.MasterContBlock = nullptr;
+    std::cout << "RAII\n";
+  }
+  ~OutlinedFunctionRAII() {
+    assert(RT.MasterContBlock == nullptr && "master region was not closed.");
+    CGM.ASTAllocaAddressSpace = oldAddrSpace;
+    RT.MasterContBlock = oldMCB;
+    std::cout << "~RAII\n";
+  }
+
+};
+
 CGOpenMPRuntimeSPIR::CGOpenMPRuntimeSPIR(CodeGenModule &CGM)
         : CGOpenMPRuntime(CGM) {
   MasterContBlock = nullptr;
   NumThreadsContBlock = nullptr;
+  NumThreads = nullptr;
   inParallel = false;
+  isTargetParallel = false;
   std::cout << "using SPIR\n";
   if (!CGM.getLangOpts().OpenMPIsDevice)
     llvm_unreachable("OpenMP SPIR can only handle device code.");
@@ -58,13 +90,11 @@ llvm::Constant * CGOpenMPRuntimeSPIR::createRuntimeFunction(OpenMPRTLFunctionSPI
 
 // Get the same Type in a given Address Space
 QualType CGOpenMPRuntimeSPIR::getAddrSpaceType(QualType T, LangAS::ID AddrSpace) {
-  if(T.getTypePtr()->isLValueReferenceType())
-    return CGM.getContext().getLValueReferenceType(getAddrSpaceType(T.getTypePtr()->getPointeeType(), AddrSpace), true);
-  if(T.getTypePtr()->isAnyPointerType())
-    return CGM.getContext().getPointerType(getAddrSpaceType(T.getTypePtr()->getPointeeType(), AddrSpace));
-  if(T.getTypePtr()->isBuiltinType())
-    return CGM.getContext().getAddrSpaceQualType(T, AddrSpace);
-  return T;
+  if(T->isLValueReferenceType())
+    return CGM.getContext().getLValueReferenceType(getAddrSpaceType(T->getPointeeType(), AddrSpace), false);
+  if(T->isAnyPointerType())
+    return CGM.getContext().getPointerType(getAddrSpaceType(T->getPointeeType(), AddrSpace));
+  return CGM.getContext().getAddrSpaceQualType(T, AddrSpace);
 }
 
 bool CGOpenMPRuntimeSPIR::isGlobal(IdentifierInfo * info) {
@@ -75,13 +105,15 @@ bool CGOpenMPRuntimeSPIR::isGlobal(IdentifierInfo * info) {
 }
 
 void CGOpenMPRuntimeSPIR::emitMasterHeader(CodeGenFunction &CGF) {
+  return; // FIXME: we must ensure that either the values get allocated in global/local addrspace or are broadcasted to other threads after master region or only stores to mem are predicated
   assert(MasterContBlock == nullptr && "cannot open two master regions");
+  std::cout << "emit master header\n";
   llvm::Value *arg[] = {CGF.Builder.getInt32(0)};
   llvm::CallInst *ltid = CGF.EmitRuntimeCall(createRuntimeFunction(get_local_id), arg);
   llvm::Value *ltid_casted = CGF.Builder.CreateTruncOrBitCast(ltid, CGF.Int32Ty);
   llvm::Value *cond = CGF.Builder.CreateIsNull(ltid_casted);
-  llvm::BasicBlock *ThenBlock = CGF.createBasicBlock("omp_if.then");
-  MasterContBlock = CGF.createBasicBlock("omp_if.end");
+  llvm::BasicBlock * ThenBlock = CGF.createBasicBlock("omp_if.then.master");
+  MasterContBlock = CGF.createBasicBlock("omp_if.end.master");
   // Generate the branch (If-stmt)
   CGF.Builder.CreateCondBr(cond, ThenBlock, MasterContBlock);
   CGF.EmitBlock(ThenBlock);
@@ -92,6 +124,8 @@ void CGOpenMPRuntimeSPIR::emitMasterFooter(CodeGenFunction &CGF) {
   // only close master region, if one is open
   if(MasterContBlock == nullptr)
     return;
+  std::cout << "emit master footer\n";
+
   CGF.EmitBranch(MasterContBlock);
   CGF.EmitBlock(MasterContBlock, true);
   MasterContBlock = nullptr;
@@ -104,8 +138,8 @@ void CGOpenMPRuntimeSPIR::emitNumThreadsHeader(CodeGenFunction &CGF, llvm::Value
   llvm::CallInst *ltid = CGF.EmitRuntimeCall(createRuntimeFunction(get_local_id), arg);
   llvm::Value *ltid_casted = CGF.Builder.CreateTruncOrBitCast(ltid, CGF.Int32Ty);
   llvm::Value *cond = CGF.Builder.CreateICmpSLT(ltid_casted, NumThreads);
-  llvm::BasicBlock *ThenBlock = CGF.createBasicBlock("omp_if.then");
-  NumThreadsContBlock = CGF.createBasicBlock("omp_if.end");
+  llvm::BasicBlock *ThenBlock = CGF.createBasicBlock("omp_if.then.num_threads");
+  NumThreadsContBlock = CGF.createBasicBlock("omp_if.end.num_threads");
   // Generate the branch (If-stmt)
   CGF.Builder.CreateCondBr(cond, ThenBlock, NumThreadsContBlock);
   CGF.EmitBlock(ThenBlock);
@@ -122,19 +156,34 @@ void CGOpenMPRuntimeSPIR::emitNumThreadsFooter(CodeGenFunction &CGF) {
   return;
 }
 
-void CGOpenMPRuntimeSPIR::setTargetParallel(OpenMPDirectiveKind kind) {
-  switch(kind) {
+bool CGOpenMPRuntimeSPIR::targetHasInnerOutlinedFunction(OpenMPDirectiveKind kind) {
+  switch (kind) {
     case OpenMPDirectiveKind::OMPD_target_parallel:
     case OpenMPDirectiveKind::OMPD_target_parallel_for:
     case OpenMPDirectiveKind::OMPD_target_parallel_for_simd:
     case OpenMPDirectiveKind::OMPD_target_teams_distribute_parallel_for:
     case OpenMPDirectiveKind::OMPD_target_teams_distribute_parallel_for_simd:
       isTargetParallel = true;
-      break;
+    case OpenMPDirectiveKind::OMPD_target_teams:
+    case OpenMPDirectiveKind::OMPD_target_teams_distribute:
+    case OpenMPDirectiveKind::OMPD_target_teams_distribute_simd:
+      return true;
     default:
-      isTargetParallel = false;
+      return false;
   }
-  return;
+}
+
+bool CGOpenMPRuntimeSPIR::teamsHasInnerOutlinedFunction(OpenMPDirectiveKind kind) {
+  switch (kind) {
+    case OpenMPDirectiveKind::OMPD_teams_distribute_parallel_for:
+    case OpenMPDirectiveKind::OMPD_teams_distribute_parallel_for_simd:
+    case OpenMPDirectiveKind::OMPD_target_teams_distribute_parallel_for:
+    case OpenMPDirectiveKind::OMPD_target_teams_distribute_parallel_for_simd:
+      isTargetParallel = true;
+      return true;
+    default:
+      return false;
+  }
 }
 
 static unsigned ArgInfoAddressSpace(unsigned LangAS) {
@@ -312,7 +361,7 @@ void CGOpenMPRuntimeSPIR::emitTargetOutlinedFunction(
 
   assert(!ParentName.empty() && "Invalid target region parent name!");
   std::cout << "emit target outlined function\n";
-  setTargetParallel(D.getDirectiveKind());
+  //setTargetParallel(D.getDirectiveKind());
   CapturedStmt &CS = *cast<CapturedStmt>(D.getAssociatedStmt());
 
   const RecordDecl *RD = CS.getCapturedRecordDecl();
@@ -320,39 +369,44 @@ void CGOpenMPRuntimeSPIR::emitTargetOutlinedFunction(
     for (auto *FD : RD->fields()) {
       // TODO: are we sure to always have a Pointer here?
       QualType ArgType = FD->getType();
-      FD->setType(getAddrSpaceType(ArgType, LangAS::opencl_global));
-      captures.push_back(I->getCapturedVar()->getIdentifier());
+      if(!I->capturesVariableByCopy() || ArgType->isAnyPointerType()) {
+        FD->setType(getAddrSpaceType(ArgType, LangAS::opencl_global));
+        captures.push_back(I->getCapturedVar()->getIdentifier());
+      }
       ++I;
     }
-
+  OutlinedFunctionRAII RAII(*this, CGM, target);
+  std::cout << "RAII created\n";
   class MasterPrePostActionTy : public PrePostActionTy {
     CGOpenMPRuntimeSPIR &RT;
+    const OMPExecutableDirective &D;
     bool isTargetParallel;
   public:
-      MasterPrePostActionTy(CGOpenMPRuntimeSPIR &RT, bool isTargetParallel)
-              : RT(RT), isTargetParallel(isTargetParallel) {}
+      MasterPrePostActionTy(CGOpenMPRuntimeSPIR &RT, const OMPExecutableDirective &D, bool isTargetParallel)
+              : RT(RT), D(D), isTargetParallel(isTargetParallel) {}
       void Enter(CodeGenFunction &CGF) override {
-        if(!isTargetParallel)
-          RT.emitMasterHeader(CGF);
+       // if(!isTargetParallel && !RT.isTargetTeams(D.getDirectiveKind()))
+        RT.emitMasterHeader(CGF);
+        std::cout << "target header emitted\n";
       }
       void Exit(CodeGenFunction &CGF) override {
         RT.emitMasterFooter(CGF);
+        std::cout << "target footer emitted\n";
       }
-  } Action(*this, isTargetParallel);
-  //if(!isTargetParallel)
+  } Action(*this, D, isTargetParallel);
+  if(!targetHasInnerOutlinedFunction(D.getDirectiveKind()))
     CodeGen.setAction(Action);
-
+  std::cout << "CodeGen Action set\n";
   emitTargetOutlinedFunctionHelper(D, ParentName, OutlinedFn, OutlinedFnID,
                                    IsOffloadEntry, CodeGen);
-
+  std::cout << "Target outlined function emitted\n";
   OutlinedFn->setCallingConv(llvm::CallingConv::SPIR_KERNEL);
   OutlinedFn->addFnAttr(llvm::Attribute::NoUnwind);
   OutlinedFn->removeFnAttr(llvm::Attribute::OptimizeNone);
-
+  OutlinedFn->dump();
   CodeGenFunction CGF(CGM);
   GenOpenCLArgMetadata(CS.getCapturedRecordDecl(), OutlinedFn,
                           OutlinedFn->getContext(), CGF.Builder);
-
 }
 
 llvm::Value *CGOpenMPRuntimeSPIR::emitParallelOutlinedFunction(
@@ -364,20 +418,24 @@ llvm::Value *CGOpenMPRuntimeSPIR::emitParallelOutlinedFunction(
   auto I = CS->captures().begin();
   for (FieldDecl *FD : RD->fields()) {
     if(isGlobal(I->getCapturedVar()->getIdentifier())) {
-      FD->setType(getAddrSpaceType(FD->getType(), LangAS::opencl_global));
+      if(!I->capturesVariableByCopy() || FD->getType()->isAnyPointerType())
+        FD->setType(getAddrSpaceType(FD->getType(), LangAS::opencl_global));
     }
     ++I;
   }
   std::cout << "emit parallel outlined function\n";
   bool wasAlreadyParallel = inParallel;
   inParallel = true;
+  OutlinedFunctionRAII RAII(*this, CGM, parallel);
   llvm::Value *OutlinedFn = CGOpenMPRuntime::emitParallelOutlinedFunction(D, ThreadIDVar, InnermostKind, CodeGen);
   inParallel = wasAlreadyParallel;
   if (auto Fn = dyn_cast<llvm::Function>(OutlinedFn)) {
     Fn->removeFnAttr(llvm::Attribute::NoInline);
     Fn->removeFnAttr(llvm::Attribute::OptimizeNone);
     Fn->addFnAttr(llvm::Attribute::AlwaysInline);
+    Fn->addFnAttr(llvm::Attribute::NoUnwind);
   }
+  OutlinedFn->dump();
   return OutlinedFn;
 }
 
@@ -388,13 +446,19 @@ void CGOpenMPRuntimeSPIR::emitParallelCall(CodeGenFunction &CGF, SourceLocation 
   if (!CGF.HaveInsertPoint())
     return;
 
+  if(!inParallel && !isTargetParallel)
+    emitMasterFooter(CGF);
+
+/*
   // TODO: clean up this mess :)
+
   if(inParallel) {
 
     std::cout << "call inner parallel function\n";
 
     auto &&ThenGen = [OutlinedFn, CapturedVars, this](CodeGenFunction &CGF,
                                                        PrePostActionTy &) {
+*/
         llvm::SmallVector<llvm::Value *, 16> RealArgs;
         RealArgs.push_back(
                 llvm::ConstantPointerNull::get(CGF.CGM.Int32Ty->getPointerTo()));
@@ -403,6 +467,7 @@ void CGOpenMPRuntimeSPIR::emitParallelCall(CodeGenFunction &CGF, SourceLocation 
         RealArgs.append(CapturedVars.begin(), CapturedVars.end());
 
         CGF.EmitCallOrInvoke(OutlinedFn, RealArgs);
+  /*
         if(this->NumThreadsContBlock)
           this->emitNumThreadsFooter(CGF);
     };
@@ -413,7 +478,7 @@ void CGOpenMPRuntimeSPIR::emitParallelCall(CodeGenFunction &CGF, SourceLocation 
     auto &&ThenGen = [OutlinedFn, CapturedVars, this](CodeGenFunction &CGF,
                                                       PrePostActionTy &) {
     emitMasterFooter(CGF);
-    // TODO: Better remove these unnecessary arguments?
+    // TODO: put either NumThreads or local_id in bound.tid to use it in for_static_init
     llvm::Value *arg[] = {CGF.Builder.getInt32(0)};
     llvm::CallInst *gtid = CGF.EmitRuntimeCall(this->createRuntimeFunction(get_global_id), arg);
     Address global_tid = CGF.CreateTempAlloca(CGF.Int32Ty, CharUnits::fromQuantity(4), ".gtid");
@@ -431,7 +496,8 @@ void CGOpenMPRuntimeSPIR::emitParallelCall(CodeGenFunction &CGF, SourceLocation 
     OutlinedFnArgs.push_back(local_tid.getPointer());  // bound_tid
     OutlinedFnArgs.append(CapturedVars.begin(), CapturedVars.end());
 
-  for(auto arg : OutlinedFnArgs) arg->dump();
+  for(auto arg : OutlinedFnArgs) {std::cout << arg->getName().str() << ": ";arg->getType()->dump(); }
+  OutlinedFn->getType()->dump();
   CGF.EmitCallOrInvoke(OutlinedFn, OutlinedFnArgs);
 
   if(this->NumThreadsContBlock)
@@ -442,20 +508,59 @@ void CGOpenMPRuntimeSPIR::emitParallelCall(CodeGenFunction &CGF, SourceLocation 
     RegionCodeGenTy ThenRCG(ThenGen);
     ThenRCG(CGF);
   }
+   */
+  if(!inParallel) {
+    if(NumThreads) {
+      emitNumThreadsFooter(CGF);
+      NumThreads = nullptr;
+    }
+    if(!isTargetParallel)
+      emitMasterHeader(CGF);
+  }
 }
 
 
 llvm::Value *CGOpenMPRuntimeSPIR::emitTeamsOutlinedFunction(
         const OMPExecutableDirective &D, const VarDecl *ThreadIDVar,
         OpenMPDirectiveKind InnermostKind, const RegionCodeGenTy &CodeGen) {
-
+  std::cout << "emit teams outlined funtion\n";
   const CapturedStmt *CS = D.getCapturedStmt(OMPD_teams);
   const RecordDecl *RD = CS->getCapturedRecordDecl();
+  auto I = CS->captures().begin();
+//  if(isTargetTeams(D.getDirectiveKind())) std::cout << "is target teams\n";
   for (auto *FD : RD->fields()) {
-    FD->setType(getAddrSpaceType(FD->getType(), LangAS::opencl_global));
+    if(!I->capturesVariableByCopy() || FD->getType()->isAnyPointerType())
+      FD->setType(getAddrSpaceType(FD->getType(), LangAS::opencl_global));
+    ++I;
   }
 
-  return CGOpenMPRuntime::emitTeamsOutlinedFunction(D, ThreadIDVar, InnermostKind, CodeGen);
+  OutlinedFunctionRAII RAII(*this, CGM, teams);
+  class TeamsPrePostActionTy : public PrePostActionTy {
+    CGOpenMPRuntimeSPIR &RT;
+  public:
+    TeamsPrePostActionTy(CGOpenMPRuntimeSPIR &RT)
+            : RT(RT) {}
+    void Enter(CodeGenFunction &CGF) override {
+      RT.emitMasterHeader(CGF);
+      std::cout << "teams header emitted\n";
+    }
+    void Exit(CodeGenFunction &CGF) override {
+      RT.emitMasterFooter(CGF);
+      std::cout << "teams footer emitted\n";
+    }
+  } Action(*this);
+  if(!teamsHasInnerOutlinedFunction(D.getDirectiveKind()))
+    CodeGen.setAction(Action);
+ //   std::cout << "teams: no inner outlined function\n";
+  //}
+  llvm::Value *OutlinedFn = CGOpenMPRuntime::emitTeamsOutlinedFunction(D, ThreadIDVar, InnermostKind, CodeGen);
+  if (auto Fn = dyn_cast<llvm::Function>(OutlinedFn)) {
+    Fn->removeFnAttr(llvm::Attribute::NoInline);
+    Fn->removeFnAttr(llvm::Attribute::OptimizeNone);
+    Fn->addFnAttr(llvm::Attribute::AlwaysInline);
+  }
+  OutlinedFn->dump();
+  return OutlinedFn;
 
 }
 
@@ -467,12 +572,7 @@ void CGOpenMPRuntimeSPIR::emitTeamsCall(CodeGenFunction &CGF,
   if (!CGF.HaveInsertPoint())
     return;
 
-  if (auto Fn = dyn_cast<llvm::Function>(OutlinedFn)) {
-    Fn->removeFnAttr(llvm::Attribute::NoInline);
-    Fn->removeFnAttr(llvm::Attribute::OptimizeNone);
-    Fn->addFnAttr(llvm::Attribute::AlwaysInline);
-  }
-
+  emitMasterFooter(CGF);
   // TODO: again, remove these arguments?
   llvm::Value * arg[] = { CGF.Builder.getInt32(0) };
   llvm::CallInst * gtid = CGF.EmitRuntimeCall(createRuntimeFunction(get_global_id), arg);
@@ -489,12 +589,7 @@ void CGOpenMPRuntimeSPIR::emitTeamsCall(CodeGenFunction &CGF,
                   /*Name*/ ".zero.addr");
 
   CGF.InitTempAlloca(ZeroAddr, CGF.Builder.getInt32(/*C*/ 0));
-  ZeroAddr.getType()->dump();
-  for(auto var : CapturedVars) {
-    var->dump();
-  }
-  OutlinedFn->getType()->dump();
-  global_tid.getType()->dump();
+
   llvm::SmallVector<llvm::Value *, 16> OutlinedFnArgs;
   OutlinedFnArgs.push_back(ZeroAddr.getPointer()); // TODO: global_tid
   OutlinedFnArgs.push_back(ZeroAddr.getPointer()); // TODO: bound_tid
@@ -532,10 +627,11 @@ void CGOpenMPRuntimeSPIR::emitForStaticInit(CodeGenFunction &CGF,
                                         bool Ordered, Address IL, Address LB,
                                         Address UB, Address ST,
                                         llvm::Value *Chunk) {
-
   llvm::Value * arg[] = { CGF.Builder.getInt32(0) };
-  llvm::CallInst * local_size = CGF.EmitRuntimeCall(createRuntimeFunction(get_local_size), arg);
-  llvm::Value * local_size_casted = CGF.Builder.CreateTruncOrBitCast(local_size, CGF.Int32Ty);
+
+  llvm::CallInst *local_size = CGF.EmitRuntimeCall(createRuntimeFunction(get_local_size), arg);
+  NumThreads = CGF.Builder.CreateTruncOrBitCast(local_size, CGF.Int32Ty);
+
   LValue LBLValue = CGF.MakeAddrLValue(LB, CGF.getContext().getIntPtrType());
   llvm::Value * lb = CGF.EmitLoadOfScalar(LBLValue, Loc);
 
@@ -550,9 +646,9 @@ void CGOpenMPRuntimeSPIR::emitForStaticInit(CodeGenFunction &CGF,
       LValue UBLValue = CGF.MakeAddrLValue(UB, CGF.getContext().getIntPtrType());
       llvm::Value *ub = CGF.EmitLoadOfScalar(UBLValue, Loc);
       llvm::Value *it_space = CGF.Builder.CreateSub(ub, lb);
-      it_space = CGF.Builder.CreateAdd(it_space, local_size_casted);
+      it_space = CGF.Builder.CreateAdd(it_space, NumThreads);
       it_space = CGF.Builder.CreateSub(it_space, CGF.Builder.getInt32(1));
-      Chunk = CGF.Builder.CreateUDiv(it_space, local_size_casted);
+      Chunk = CGF.Builder.CreateUDiv(it_space, NumThreads);
     } else {
       // If no schedule is specified, scheduling is implementation defined.
       // For the spir target, we choose schedule(static,1) as default
@@ -574,7 +670,7 @@ void CGOpenMPRuntimeSPIR::emitForStaticInit(CodeGenFunction &CGF,
   CGF.EmitStoreOfScalar(ub, CGF.MakeAddrLValue(UB, CGF.getContext().getIntPtrType()), true);
 
   // stride is: local workgroup size (* chunksize)
-  llvm::Value * stride = CGF.Builder.CreateMul(local_size_casted, Chunk);
+  llvm::Value * stride = CGF.Builder.CreateMul(NumThreads, Chunk);
   CGF.EmitStoreOfScalar(stride, CGF.MakeAddrLValue(ST, CGF.getContext().getIntPtrType()), true);
 }
 
@@ -646,8 +742,11 @@ void CGOpenMPRuntimeSPIR::emitNumThreadsClause(CodeGenFunction &CGF,
   // only emit this clause if it is the outermost parallel construct
   if(inParallel)
     return;
+  std::cout << "emit num threads\n";
   // principle: if(thread_id < NumThreads) {...}
   emitNumThreadsHeader(CGF, NumThreads);
+  // TODO: put this in bound.tid and use it for for_static_init
+  this->NumThreads = NumThreads;
   // Footer must be emitted by end of parallel region
 }
 
@@ -660,7 +759,7 @@ void CGOpenMPRuntimeSPIR::emitForDispatchInit(
         CodeGenFunction &CGF, SourceLocation Loc,
         const OpenMPScheduleTy &ScheduleKind, unsigned IVSize, bool IVSigned,
         bool Ordered, const DispatchRTInput &DispatchValues) {
-  assert(false && "For SPIR target, dynamic dispatch is not supported.");
+  llvm_unreachable("For SPIR target, dynamic dispatch is not supported.");
 }
 
 bool CGOpenMPRuntimeSPIR::isStaticNonchunked(OpenMPScheduleClauseKind ScheduleKind,
@@ -669,15 +768,39 @@ bool CGOpenMPRuntimeSPIR::isStaticNonchunked(OpenMPScheduleClauseKind ScheduleKi
   // as we want to emit schedule(static,1) if no schedule clause is specified
   // more precise: the case below is the only one, for which we partition the iteration space
   // into chunks of equal size only to be conformant with the specification
-  return (ScheduleKind == OpenMPScheduleClauseKind ::OMPC_SCHEDULE_static && !Chunked);
+  return (ScheduleKind == OpenMPScheduleClauseKind::OMPC_SCHEDULE_static && !Chunked);
 }
 
 bool CGOpenMPRuntimeSPIR::isStaticNonchunked(
         OpenMPDistScheduleClauseKind ScheduleKind, bool Chunked) const {
-  return ScheduleKind == OpenMPDistScheduleClauseKind ::OMPC_DIST_SCHEDULE_static && !Chunked;
+  return ScheduleKind == OpenMPDistScheduleClauseKind::OMPC_DIST_SCHEDULE_static && !Chunked;
 }
 
 bool CGOpenMPRuntimeSPIR::isDynamic(OpenMPScheduleClauseKind ScheduleKind) const {
   // we don't support real dynamic scheduling and just emit everything as static
   return false;
+}
+
+void CGOpenMPRuntimeSPIR::emitInlinedDirective(CodeGenFunction &CGF,
+                                           OpenMPDirectiveKind InnerKind,
+                                           const RegionCodeGenTy &CodeGen,
+                                           bool HasCancel) {
+  if (!CGF.HaveInsertPoint())
+    return;
+  bool oldInParallel;
+  switch(InnerKind) {
+    case OpenMPDirectiveKind::OMPD_distribute_parallel_for:
+    case OpenMPDirectiveKind::OMPD_distribute_parallel_for_simd:
+      emitMasterFooter(CGF);
+      oldInParallel = inParallel;
+      inParallel = true;
+      CGOpenMPRuntime::emitInlinedDirective(CGF, InnerKind, CodeGen, HasCancel);
+      inParallel = oldInParallel;
+      if(!inParallel)
+        emitMasterHeader(CGF);
+      break;
+    default:
+      CGOpenMPRuntime::emitInlinedDirective(CGF, InnerKind, CodeGen, HasCancel);
+  }
+  return;
 }

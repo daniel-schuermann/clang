@@ -26,6 +26,15 @@ namespace CodeGen {
 
 class CGOpenMPRuntimeSPIR : public CGOpenMPRuntime {
 
+public:
+  llvm::BasicBlock * MasterContBlock;
+
+  enum AllocaAddrSpace {
+    parallel = 0,
+    target = LangAS::opencl_global,
+    teams = LangAS::opencl_local
+  };
+
 protected:
   enum OpenMPRTLFunctionSPIR {
     get_global_id,
@@ -39,17 +48,18 @@ protected:
   QualType getAddrSpaceType(QualType T, LangAS::ID AddrSpace);
   bool isGlobal(IdentifierInfo * info);
   SmallVector<IdentifierInfo *, 16> captures;
-  llvm::BasicBlock * MasterContBlock;
   llvm::BasicBlock * NumThreadsContBlock;
+  llvm::Value * NumThreads;
   void emitMasterHeader(CodeGenFunction &CGF);
   void emitMasterFooter(CodeGenFunction &CGF);
   void emitNumThreadsHeader(CodeGenFunction &CGF, llvm::Value *NumThreads);
   void emitNumThreadsFooter(CodeGenFunction &CGF);
   void GenOpenCLArgMetadata(const RecordDecl *FD, llvm::Function *Fn, llvm::LLVMContext &Context, CGBuilderTy &Builder);
   llvm::Constant *createRuntimeFunction(OpenMPRTLFunctionSPIR Function);
-  void setTargetParallel(OpenMPDirectiveKind kind);
   bool isTargetParallel;
   bool inParallel;
+  bool targetHasInnerOutlinedFunction(OpenMPDirectiveKind kind);
+  bool teamsHasInnerOutlinedFunction(OpenMPDirectiveKind kind);
 
 public:
   explicit CGOpenMPRuntimeSPIR(CodeGenModule &CGM);
@@ -250,6 +260,17 @@ public:
   ///
   virtual bool isDynamic(OpenMPScheduleClauseKind ScheduleKind) const;
 
+  /// \brief Emit code for the directive that does not require outlining.
+  ///
+  /// \param InnermostKind Kind of innermost directive (for simple directives it
+  /// is a directive itself, for combined - its innermost directive).
+  /// \param CodeGen Code generation sequence for the \a D directive.
+  /// \param HasCancel true if region has inner cancel directive, false
+  /// otherwise.
+  virtual void emitInlinedDirective(CodeGenFunction &CGF,
+                                    OpenMPDirectiveKind InnermostKind,
+                                    const RegionCodeGenTy &CodeGen,
+                                    bool HasCancel = false);
 };
 
 } // CodeGen namespace.
