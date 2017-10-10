@@ -151,6 +151,13 @@ public:
                                bool EmitChecks = true,
                                bool ForceSimpleCall = false);
 
+  /// Translates the native parameter of outlined function if this is required
+  /// for target.
+  /// \param FD Field decl from captured record for the paramater.
+  /// \param NativeParam Parameter itself.
+  const VarDecl *translateParameter(const FieldDecl *FD,
+                                    const VarDecl *NativeParam) const override;
+
   /// \brief Call the appropriate runtime routine to initialize it before start
   /// of loop.
   ///
@@ -158,69 +165,45 @@ public:
   /// specify a ordered clause on the loop construct.
   /// Depending on the loop schedule, it is necessary to call some runtime
   /// routine before start of the OpenMP loop to get the loop upper / lower
-  /// bounds \a LB and \a UB and stride \a ST.
+  /// bounds LB and UB and stride ST.
   ///
   /// \param CGF Reference to current CodeGenFunction.
   /// \param Loc Clang source location.
+  /// \param DKind Kind of the directive.
   /// \param ScheduleKind Schedule kind, specified by the 'schedule' clause.
-  /// \param IVSize Size of the iteration variable in bits.
-  /// \param IVSigned Sign of the interation variable.
-  /// \param Ordered true if loop is ordered, false otherwise.
-  /// \param IL Address of the output variable in which the flag of the
-  /// last iteration is returned.
-  /// \param LB Address of the output variable in which the lower iteration
-  /// number is returned.
-  /// \param UB Address of the output variable in which the upper iteration
-  /// number is returned.
-  /// \param ST Address of the output variable in which the stride value is
-  /// returned nesessary to generated the static_chunked scheduled loop.
-  /// \param Chunk Value of the chunk for the static_chunked scheduled loop.
-  /// For the default (nullptr) value, the chunk 1 will be used.
+  /// \param Values Input arguments for the construct.
   ///
   virtual void emitForStaticInit(CodeGenFunction &CGF, SourceLocation Loc,
+                                 OpenMPDirectiveKind DKind,
                                  const OpenMPScheduleTy &ScheduleKind,
-                                 unsigned IVSize, bool IVSigned, bool Ordered,
-                                 Address IL, Address LB, Address UB, Address ST,
-                                 llvm::Value *Chunk = nullptr);
+                                 const StaticRTInput &Values) override;
 
   ///
   /// \param CGF Reference to current CodeGenFunction.
   /// \param Loc Clang source location.
   /// \param SchedKind Schedule kind, specified by the 'dist_schedule' clause.
-  /// \param IVSize Size of the iteration variable in bits.
-  /// \param IVSigned Sign of the interation variable.
-  /// \param Ordered true if loop is ordered, false otherwise.
-  /// \param IL Address of the output variable in which the flag of the
-  /// last iteration is returned.
-  /// \param LB Address of the output variable in which the lower iteration
-  /// number is returned.
-  /// \param UB Address of the output variable in which the upper iteration
-  /// number is returned.
-  /// \param ST Address of the output variable in which the stride value is
-  /// returned nesessary to generated the static_chunked scheduled loop.
-  /// \param Chunk Value of the chunk for the static_chunked scheduled loop.
-  /// For the default (nullptr) value, the chunk 1 will be used.
+  /// \param Values Input arguments for the construct.
   ///
-  virtual void emitDistributeStaticInit(CodeGenFunction &CGF, SourceLocation Loc,
+  virtual void emitDistributeStaticInit(CodeGenFunction &CGF,
+                                        SourceLocation Loc,
                                         OpenMPDistScheduleClauseKind SchedKind,
-                                        unsigned IVSize, bool IVSigned,
-                                        bool Ordered, Address IL, Address LB,
-                                        Address UB, Address ST,
-                                        llvm::Value *Chunk = nullptr);
+                                        const StaticRTInput &Values) override;
 
   /// \brief Call the appropriate runtime routine to notify that we finished
   /// all the work with current loop.
   ///
   /// \param CGF Reference to current CodeGenFunction.
   /// \param Loc Clang source location.
+  /// \param DKind Kind of the directive for which the static finish is emitted.
   ///
-  virtual void emitForStaticFinish(CodeGenFunction &CGF, SourceLocation Loc);
+  virtual void emitForStaticFinish(CodeGenFunction &CGF, SourceLocation Loc,
+                                   OpenMPDirectiveKind DKind);
 
   // unsupported
   virtual void emitForDispatchInit(CodeGenFunction &CGF, SourceLocation Loc,
                                    const OpenMPScheduleTy &ScheduleKind,
                                    unsigned IVSize, bool IVSigned, bool Ordered,
-                                   const DispatchRTInput &DispatchValues);
+                                   const DispatchRTInput &DispatchValues) override;
 
   /// \brief Emits call to void __kmpc_push_num_threads(ident_t *loc, kmp_int32
   /// global_tid, kmp_int32 num_threads) to generate code for 'num_threads'
