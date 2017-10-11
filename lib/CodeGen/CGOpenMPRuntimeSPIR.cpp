@@ -696,19 +696,26 @@ CGOpenMPRuntimeSPIR::translateParameter(const FieldDecl *FD,
     }
   }
 }
+
 void CGOpenMPRuntimeSPIR::emitForStaticInit(CodeGenFunction &CGF, SourceLocation Loc,
                        OpenMPDirectiveKind DKind,
                        const OpenMPScheduleTy &ScheduleKind,
                        const CGOpenMPRuntime::StaticRTInput &Values) {
-  llvm::Value * arg[] = { CGF.Builder.getInt32(0) };
-
-  llvm::CallInst *local_size = CGF.EmitRuntimeCall(createRuntimeFunction(get_local_size), arg);
-  NumThreads = CGF.Builder.CreateTruncOrBitCast(local_size, CGF.Int32Ty);
 
   LValue LBLValue = CGF.MakeAddrLValue(Values.LB, CGF.getContext().getIntPtrType());
+  LValue UBLValue = CGF.MakeAddrLValue(Values.UB, CGF.getContext().getIntPtrType());
+  LValue StrideLValue = CGF.MakeAddrLValue(Values.ST, CGF.getContext().getIntPtrType());
+  // take lb
   llvm::Value * lb = CGF.EmitLoadOfScalar(LBLValue, Loc);
-  llvm::Value * chunk = Values.Chunk;
+  // get int type from values:
+  llvm::Type * intType = lb->getType();
+  llvm::Value * one = CGF.Builder.getIntN(intType->getPrimitiveSizeInBits(),1);
 
+  llvm::Value * arg[] = { CGF.Builder.getInt32(0) };
+  llvm::CallInst *local_size = CGF.EmitRuntimeCall(createRuntimeFunction(get_local_size), arg);
+  NumThreads = CGF.Builder.CreateSExtOrTrunc(local_size, intType);
+
+  llvm::Value * chunk = Values.Chunk;
   if(chunk == nullptr) {
     /** Static Scheduling:
      * When no chunk_size is specified, the iteration space is divided into chunks
@@ -717,55 +724,63 @@ void CGOpenMPRuntimeSPIR::emitForStaticInit(CodeGenFunction &CGF, SourceLocation
      */
     if(ScheduleKind.Schedule == OpenMPScheduleClauseKind::OMPC_SCHEDULE_static) {
       // here we do: chunksize = (ub-lb+local_size-1)/local_size
-      LValue UBLValue = CGF.MakeAddrLValue(Values.UB, CGF.getContext().getIntPtrType());
       llvm::Value *ub = CGF.EmitLoadOfScalar(UBLValue, Loc);
       llvm::Value *it_space = CGF.Builder.CreateSub(ub, lb);
       it_space = CGF.Builder.CreateAdd(it_space, NumThreads);
-      it_space = CGF.Builder.CreateSub(it_space, CGF.Builder.getInt32(1));
+      it_space = CGF.Builder.CreateSub(it_space, one);
       chunk = CGF.Builder.CreateUDiv(it_space, NumThreads);
     } else {
       // If no schedule is specified, scheduling is implementation defined.
       // For the spir target, we choose schedule(static,1) as default
-      chunk = CGF.Builder.getInt32(1);
+      chunk = one;
     }
   }
 
-  llvm::CallInst * locid = CGF.EmitRuntimeCall(createRuntimeFunction(get_local_id), arg);
-  llvm::Value * ltid = CGF.Builder.CreateTruncOrBitCast(locid, CGF.Int32Ty);
+  llvm::CallInst * ltid = CGF.EmitRuntimeCall(createRuntimeFunction(get_local_id), arg);
+  llvm::Value * ltid_casted = CGF.Builder.CreateSExtOrTrunc(ltid, intType);
 
   // lower bound is: provided lb + localthreadID (* chunksize)
-  llvm::Value * lbdiff = CGF.Builder.CreateMul(ltid, chunk);
+  llvm::Value * lbdiff = CGF.Builder.CreateMul(ltid_casted, chunk);
+  lbdiff->dump();
   lb = CGF.Builder.CreateAdd(lb, lbdiff);
   CGF.EmitStoreOfScalar(lb, LBLValue, true);
 
   // upper bound is: lb + chunk-1 (for chunksize=1, this results in lb=ub)
-  llvm::Value * ch = CGF.Builder.CreateSub(chunk, CGF.Builder.getInt32(1));
+  llvm::Value * ch = CGF.Builder.CreateSub(chunk, one);
   llvm::Value * ub = CGF.Builder.CreateAdd(lb, ch);
-  CGF.EmitStoreOfScalar(ub, CGF.MakeAddrLValue(Values.UB, CGF.getContext().getIntPtrType()), true);
+  CGF.EmitStoreOfScalar(ub, UBLValue, true);
 
   // stride is: local workgroup size (* chunksize)
   llvm::Value * stride = CGF.Builder.CreateMul(NumThreads, chunk);
-  CGF.EmitStoreOfScalar(stride, CGF.MakeAddrLValue(Values.ST, CGF.getContext().getIntPtrType()), true);
+  CGF.EmitStoreOfScalar(stride, StrideLValue, true);
 }
 
 void CGOpenMPRuntimeSPIR::emitDistributeStaticInit(CodeGenFunction &CGF,
                               SourceLocation Loc,
                               OpenMPDistScheduleClauseKind SchedKind,
                               const CGOpenMPRuntime::StaticRTInput &Values) {
+  LValue LBLValue = CGF.MakeAddrLValue(Values.LB, CGF.getContext().getIntPtrType());
+  LValue UBLValue = CGF.MakeAddrLValue(Values.UB, CGF.getContext().getIntPtrType());
+  LValue StrideLValue = CGF.MakeAddrLValue(Values.ST, CGF.getContext().getIntPtrType());
+  // take lb
+  llvm::Value * lb = CGF.EmitLoadOfScalar(LBLValue, Loc);
+  // get int type from values:
+  llvm::Type * intType = lb->getType();
+  llvm::Value * one = CGF.Builder.getIntN(intType->getPrimitiveSizeInBits(),1);
+
   // take num_groups
   llvm::Value * arg[] = { CGF.Builder.getInt32(0) };
   llvm::CallInst * num_groups = CGF.EmitRuntimeCall(createRuntimeFunction(get_num_groups), arg);
-  llvm::Value * num_groups_casted = CGF.Builder.CreateTruncOrBitCast(num_groups, CGF.Int32Ty);
-  // take lb
-  LValue LBLValue = CGF.MakeAddrLValue(Values.LB, CGF.getContext().getIntPtrType());
-  llvm::Value * lb = CGF.EmitLoadOfScalar(LBLValue, Loc);
+  llvm::Value * num_groups_casted = CGF.Builder.CreateSExtOrTrunc(num_groups, intType);
+
+  //lb = CGF.Builder.CreateTruncOrBitCast(lb, CGF.Int32Ty);
 
   llvm::Value * chunk = Values.Chunk;
   if(chunk == nullptr) {
     // chunksize is unspecified: calculate a reasonable chunksize
     // chunksize should be multiple of local_size:
     llvm::CallInst *local_size = CGF.EmitRuntimeCall(createRuntimeFunction(get_local_size), arg);
-    llvm::Value *local_size_casted = CGF.Builder.CreateTruncOrBitCast(local_size, CGF.Int32Ty);
+    llvm::Value *local_size_casted = CGF.Builder.CreateSExtOrTrunc(local_size, intType);
 
     if(SchedKind == OpenMPDistScheduleClauseKind::OMPC_DIST_SCHEDULE_static) {
       /* 2.10.8 distribute construct - dist_schedule(static)
@@ -774,13 +789,12 @@ void CGOpenMPRuntimeSPIR::emitDistributeStaticInit(CodeGenFunction &CGF,
        * and at most one chunk is distributed to each team of the league.
        */
       // here we do: chunksize = ((((ub-lb+local_size-1)/local_size)+num_groups-1)/num_groups)*local_size
-      LValue UBLValue = CGF.MakeAddrLValue(Values.UB, CGF.getContext().getIntPtrType());
       llvm::Value *ub = CGF.EmitLoadOfScalar(UBLValue, Loc);
       llvm::Value *diff = CGF.Builder.CreateSub(ub, lb);
-      llvm::Value *total = CGF.Builder.CreateSub(diff, CGF.Builder.getInt32(1));
+      llvm::Value *total = CGF.Builder.CreateSub(diff, one);
       llvm::Value *num_blocks = CGF.Builder.CreateUDiv(total, local_size_casted);
       num_blocks = CGF.Builder.CreateAdd(num_blocks, num_groups_casted);
-      num_blocks = CGF.Builder.CreateSub(num_blocks, CGF.Builder.getInt32(1));
+      num_blocks = CGF.Builder.CreateSub(num_blocks, one);
       chunk = CGF.Builder.CreateMul(CGF.Builder.CreateUDiv(num_blocks, num_groups_casted), local_size_casted);
 
     } else {
@@ -788,22 +802,22 @@ void CGOpenMPRuntimeSPIR::emitDistributeStaticInit(CodeGenFunction &CGF,
       // we just assign local_size as chunksize and do round-robin
       chunk = local_size_casted;
     }
-  }
+  } else { /* chunk already specified */ }
 
   llvm::CallInst * gid = CGF.EmitRuntimeCall(createRuntimeFunction(get_group_id), arg);
-  llvm::Value * gid_casted = CGF.Builder.CreateTruncOrBitCast(gid, CGF.Int32Ty);
+  llvm::Value * gid_casted = CGF.Builder.CreateSExtOrTrunc(gid, intType);
 
   // lower bound is: lb + groupID * chunksize
   lb = CGF.Builder.CreateAdd(CGF.Builder.CreateMul(gid_casted, chunk), lb);
   CGF.EmitStoreOfScalar(lb, LBLValue, true);
 
   // upper bound is: lb + chunksize-1
-  llvm::Value * ub = CGF.Builder.CreateAdd(lb, CGF.Builder.CreateSub(chunk, CGF.Builder.getInt32(1)));
-  CGF.EmitStoreOfScalar(ub, CGF.MakeAddrLValue(Values.UB, CGF.getContext().getIntPtrType()), true);
+  llvm::Value * ub = CGF.Builder.CreateAdd(lb, CGF.Builder.CreateSub(chunk, one));
+  CGF.EmitStoreOfScalar(ub, UBLValue, true);
 
   // stride is: chunksize * num_groups
   llvm::Value * stride = CGF.Builder.CreateMul(chunk, num_groups_casted);
-  CGF.EmitStoreOfScalar(stride, CGF.MakeAddrLValue(Values.ST, CGF.getContext().getIntPtrType()), true);
+  CGF.EmitStoreOfScalar(stride, StrideLValue, true);
 }
 
 void CGOpenMPRuntimeSPIR::emitForStaticFinish(CodeGenFunction &CGF, SourceLocation Loc,
