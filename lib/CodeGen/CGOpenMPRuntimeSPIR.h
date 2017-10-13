@@ -49,9 +49,10 @@ protected:
   bool isGlobal(IdentifierInfo * info);
   SmallVector<IdentifierInfo *, 16> captures;
   llvm::BasicBlock * NumThreadsContBlock;
+  CodeGenFunction * currentCGF;
   llvm::Value * NumThreads;
   void emitMasterHeader(CodeGenFunction &CGF);
-  void emitMasterFooter(CodeGenFunction &CGF);
+  void emitMasterFooter();
   void emitNumThreadsHeader(CodeGenFunction &CGF, llvm::Value *NumThreads);
   void emitNumThreadsFooter(CodeGenFunction &CGF);
   void GenOpenCLArgMetadata(const RecordDecl *FD, llvm::Function *Fn, llvm::LLVMContext &Context, CGBuilderTy &Builder);
