@@ -24,24 +24,16 @@ class OutlinedFunctionRAII {
   CGOpenMPRuntimeSPIR &RT;
   CodeGenModule &CGM;
   llvm::BasicBlock * oldMCB;
-  unsigned oldAddrSpace;
 
 public:
-  OutlinedFunctionRAII(CGOpenMPRuntimeSPIR &RT, CodeGenModule &CGM, CGOpenMPRuntimeSPIR::AllocaAddrSpace AddrSpace)
-    : RT(RT), CGM(CGM), oldMCB(RT.MasterContBlock), oldAddrSpace(CGM.ASTAllocaAddressSpace) {
-    // FIXME: allocaaddrspace is ignored. reset Datalayout to: e-p${AddrSpace}:64:64:....
-    CGM.ASTAllocaAddressSpace = (unsigned) AddrSpace;
-    const std::string &dl =CGM.getDataLayout().getStringRepresentation();
-    std::string newDL = "e-p" + std::to_string(AddrSpace) + dl.substr(3);
-    std::cout << newDL << "\n";
+  OutlinedFunctionRAII(CGOpenMPRuntimeSPIR &RT, CodeGenModule &CGM)
+    : RT(RT), CGM(CGM), oldMCB(RT.MasterContBlock) {
 
-    //CGM.getDataLayout().reset(StringRef(newDL));
     RT.MasterContBlock = nullptr;
     std::cout << "RAII\n";
   }
   ~OutlinedFunctionRAII() {
     assert(RT.MasterContBlock == nullptr && "master region was not closed.");
-    CGM.ASTAllocaAddressSpace = oldAddrSpace;
     RT.MasterContBlock = oldMCB;
     std::cout << "~RAII\n";
   }
@@ -50,6 +42,7 @@ public:
 
 CGOpenMPRuntimeSPIR::CGOpenMPRuntimeSPIR(CodeGenModule &CGM)
         : CGOpenMPRuntime(CGM) {
+  CGM.ASTAllocaAddressSpace = 4; // this is to ensure that alloca gets casted to Default
   MasterContBlock = nullptr;
   NumThreadsContBlock = nullptr;
   NumThreads = nullptr;
@@ -58,12 +51,11 @@ CGOpenMPRuntimeSPIR::CGOpenMPRuntimeSPIR(CodeGenModule &CGM)
   std::cout << "using SPIR\n";
   if (!CGM.getLangOpts().OpenMPIsDevice)
     llvm_unreachable("OpenMP SPIR can only handle device code.");
-  std::cout << std::string(CGM.getDataLayout().getStringRepresentation()) << "\n";
 }
 
 llvm::Constant * CGOpenMPRuntimeSPIR::createRuntimeFunction(OpenMPRTLFunctionSPIR Function) {
   llvm::Type *param[] = {CGM.Int32Ty};
-  switch(Function) {
+  switch (Function) {
     case get_global_id: {
       return CGM.CreateRuntimeFunction(llvm::FunctionType::get(CGM.SizeTy, param, false), "_Z13get_global_idj");
     }
@@ -80,32 +72,25 @@ llvm::Constant * CGOpenMPRuntimeSPIR::createRuntimeFunction(OpenMPRTLFunctionSPI
       return CGM.CreateRuntimeFunction(llvm::FunctionType::get(CGM.SizeTy, param, false), "_Z12get_group_idj");
     }
     case work_group_barrier: {
-      //CLK_GLOBAL_MEM_FENCE   0x02
+      //CLK_GLOBAL_MEM_FENCE   0x02 or (1 << 1)
+      //CLK_LOCAL_MEM_FENCE    0x01 or (1 << 0)
       return CGM.CreateRuntimeFunction(llvm::FunctionType::get(CGM.VoidTy, param, false), "_Z18work_group_barrierj");
+    }
+    case mem_fence: {
+      return CGM.CreateRuntimeFunction(llvm::FunctionType::get(CGM.VoidTy, param, false), "_Z9mem_fencej");
+    }
+    case read_mem_fence: {
+      return CGM.CreateRuntimeFunction(llvm::FunctionType::get(CGM.VoidTy, param, false), "_Z14read_mem_fencej");
+    }
+    case write_mem_fence: {
+      return CGM.CreateRuntimeFunction(llvm::FunctionType::get(CGM.VoidTy, param, false), "_Z15write_mem_fencej");
     }
     default:
       return nullptr;
   }
 }
 
-// Get the same Type in a given Address Space
-QualType CGOpenMPRuntimeSPIR::getAddrSpaceType(QualType T, LangAS::ID AddrSpace) {
-  if(T->isLValueReferenceType())
-    return CGM.getContext().getLValueReferenceType(getAddrSpaceType(T->getPointeeType(), AddrSpace), false);
-  if(T->isAnyPointerType())
-    return CGM.getContext().getPointerType(getAddrSpaceType(T->getPointeeType(), AddrSpace));
-  return CGM.getContext().getAddrSpaceQualType(T, AddrSpace);
-}
-
-bool CGOpenMPRuntimeSPIR::isGlobal(IdentifierInfo * info) {
-  for(IdentifierInfo * capture : captures) {
-    if(capture == info) return true;
-  }
-  return false;
-}
-
 void CGOpenMPRuntimeSPIR::emitMasterHeader(CodeGenFunction &CGF) {
-  //return; // FIXME: we must ensure that either the values get allocated in global/local addrspace or are broadcasted to other threads after master region or only stores to mem are predicated
   assert(MasterContBlock == nullptr && "cannot open two master regions");
   std::cout << "emit master header\n";
   llvm::Value *arg[] = {CGF.Builder.getInt32(0)};
@@ -123,10 +108,9 @@ void CGOpenMPRuntimeSPIR::emitMasterHeader(CodeGenFunction &CGF) {
 
 void CGOpenMPRuntimeSPIR::emitMasterFooter() {
   // only close master region, if one is open
-  if(MasterContBlock == nullptr)
+  if (MasterContBlock == nullptr)
     return;
   std::cout << "emit master footer\n";
-
   currentCGF->EmitBranch(MasterContBlock);
   currentCGF->EmitBlock(MasterContBlock, true);
   MasterContBlock = nullptr;
@@ -149,7 +133,7 @@ void CGOpenMPRuntimeSPIR::emitNumThreadsHeader(CodeGenFunction &CGF, llvm::Value
 
 void CGOpenMPRuntimeSPIR::emitNumThreadsFooter(CodeGenFunction &CGF) {
   // only close num_threads region, if there is one
-  if(NumThreadsContBlock == nullptr)
+  if (NumThreadsContBlock == nullptr)
     return;
   CGF.EmitBranch(NumThreadsContBlock);
   CGF.EmitBlock(NumThreadsContBlock, true);
@@ -200,9 +184,10 @@ static unsigned ArgInfoAddressSpace(unsigned LangAS) {
 
 // TODO clean up unnecessary code
 void CGOpenMPRuntimeSPIR::GenOpenCLArgMetadata(const RecordDecl *FD, llvm::Function *Fn,
-                                 /*CodeGenModule &CGM,*/ llvm::LLVMContext &Context,
-                                 CGBuilderTy &Builder) {
-
+                                 CodeGenModule &CGM) {
+  CodeGenFunction CGF(CGM);
+  llvm::LLVMContext &Context = CGM.getLLVMContext();
+  CGBuilderTy Builder = CGF.Builder;
   SmallVector<llvm::Metadata *, 8> opSource = {
           llvm::ConstantAsMetadata::get(Builder.getInt32(3)), // OpenCL C
           llvm::ConstantAsMetadata::get(Builder.getInt32(10000))}; // OpenCL C Version
@@ -359,57 +344,31 @@ void CGOpenMPRuntimeSPIR::emitTargetOutlinedFunction(
         bool IsOffloadEntry, const RegionCodeGenTy &CodeGen) {
   if (!IsOffloadEntry) // Nothing to do.
     return;
-for(auto clause : D.clauses()) {
-  if(clause->isImplicit())std::cout << "clause is implicit\n";
-  std::cout << clause->getClauseKind() << "\n";
-  if(clause->getClauseKind() == OpenMPClauseKind::OMPC_map) std::cout << "is map clause\n";
-  if(clause->getClauseKind() == OpenMPClauseKind::OMPC_shared) std::cout << "is shared clause\n";
 
-  for(auto child : clause->children()) {
-    child->dump();
-  }
-
-  // TODO: try to set addrspaces according to clauses in target, teams and parallel
-}
   assert(!ParentName.empty() && "Invalid target region parent name!");
   std::cout << "emit target outlined function\n";
   //setTargetParallel(D.getDirectiveKind());
   CapturedStmt &CS = *cast<CapturedStmt>(D.getAssociatedStmt());
+  for (auto capture : CS.captures()) {
+    globals.insert(capture.getCapturedVar()->getDeclName());
+  }
 
-  const RecordDecl *RD = CS.getCapturedRecordDecl();
-  auto I = CS.captures().begin();
-    for (FieldDecl *FD : RD->fields()) {
-      // TODO: are we sure to always have a Pointer here?
-      QualType ArgType = FD->getType();
-      if(!I->capturesVariableByCopy() || ArgType->isAnyPointerType()) {
-        FD->setType(getAddrSpaceType(ArgType, LangAS::opencl_global));
-        captures.push_back(I->getCapturedVar()->getIdentifier());
-      }
-      ++I;
+  OutlinedFunctionRAII RAII(*this, CGM);
+  class MasterPrePostActionTy : public PrePostActionTy {
+    CGOpenMPRuntimeSPIR &RT;
+  public:
+    MasterPrePostActionTy(CGOpenMPRuntimeSPIR &RT) : RT(RT) {}
+    void Enter(CodeGenFunction &CGF) override {
+      RT.emitMasterHeader(CGF);
+      std::cout << "target header emitted\n";
     }
-  OutlinedFunctionRAII RAII(*this, CGM, target);
-  std::cout << "RAII created\n";
 
-    class MasterPrePostActionTy : public PrePostActionTy {
-      CGOpenMPRuntimeSPIR &RT;
-      const OMPExecutableDirective &D;
-      bool isTargetParallel;
-    public:
-      MasterPrePostActionTy(CGOpenMPRuntimeSPIR &RT, const OMPExecutableDirective &D, bool isTargetParallel)
-              : RT(RT), D(D), isTargetParallel(isTargetParallel) {}
-
-      void Enter(CodeGenFunction &CGF) override {
-        // if(!isTargetParallel && !RT.isTargetTeams(D.getDirectiveKind()))
-        RT.emitMasterHeader(CGF);
-        std::cout << "target header emitted\n";
-      }
-
-      void Exit(CodeGenFunction &CGF) override {
-        RT.emitMasterFooter();
-        std::cout << "target footer emitted\n";
-      }
-    } Action(*this, D, isTargetParallel);
-  if(!targetHasInnerOutlinedFunction(D.getDirectiveKind())) {
+    void Exit(CodeGenFunction &CGF) override {
+      RT.emitMasterFooter();
+      std::cout << "target footer emitted\n";
+    }
+  } Action(*this);
+  if (!targetHasInnerOutlinedFunction(D.getDirectiveKind())) {
     CodeGen.setAction(Action);
   }
   std::cout << "CodeGen Action set\n";
@@ -420,58 +379,54 @@ for(auto clause : D.clauses()) {
   OutlinedFn->addFnAttr(llvm::Attribute::NoUnwind);
   OutlinedFn->removeFnAttr(llvm::Attribute::OptimizeNone);
   OutlinedFn->dump();
-  CodeGenFunction CGF(CGM);
-  GenOpenCLArgMetadata(CS.getCapturedRecordDecl(), OutlinedFn,
-                          OutlinedFn->getContext(), CGF.Builder);
+  GenOpenCLArgMetadata(CS.getCapturedRecordDecl(), OutlinedFn, CGM);
 }
 
 llvm::Value *CGOpenMPRuntimeSPIR::emitParallelOutlinedFunction(
         const OMPExecutableDirective &D, const VarDecl *ThreadIDVar,
         OpenMPDirectiveKind InnermostKind, const RegionCodeGenTy &CodeGen) {
   // first, we must close any open master sections:
-  this->emitMasterFooter();
+  // TODO: only in "distribute parallel for" directives
+  //if (isOpenMPDistributeDirective(D.getDirectiveKind())) {
+    this->emitMasterFooter();
+  //}
 
-  // TODO: create PostActionTy to broadcast variable from thread lastIt to all in WG, then leave it private
+  // TODO: create PostActionTy to broadcast variable from thread lastIt to all in WG, then leave it private?
   llvm::DenseSet<const VarDecl *> Lastprivates;
   for (const auto *C : D.getClausesOfKind<OMPLastprivateClause>()) {
     for (const auto *D : C->varlists())
       Lastprivates.insert(cast<VarDecl>(cast<DeclRefExpr>(D)->getDecl())->getCanonicalDecl());
   }
 
-  SmallVector<IdentifierInfo *, 16> privates;
-  // TODO: create PreActionTy to broadcast variable from thread 0 to all in WG
-  for(const auto *C : D.getClausesOfKind<OMPFirstprivateClause>()) {
-    auto IRef = C->varlist_begin();
-    for (auto IInit : C->private_copies()) {
-      auto *OrigVD = cast<VarDecl>(cast<DeclRefExpr>(*IRef)->getDecl());
+  llvm::DenseSet<DeclarationName> FirstPrivates;
+  // Fixme: firstprivate causes invalid cast, why?
+  // TODO: create PreActionTy to broadcast variable from thread 0 to all in WG?
+  for (const auto *C : D.getClausesOfKind<OMPFirstprivateClause>()) {
+    for (const auto *D : C->varlists()) {
+      auto *OrigVD = cast<VarDecl>(cast<DeclRefExpr>(D)->getDecl());
       bool ThisFirstprivateIsLastprivate =
               Lastprivates.count(OrigVD->getCanonicalDecl()) > 0;
-      if(!ThisFirstprivateIsLastprivate)
-        privates.push_back(OrigVD->getIdentifier());
-      ++IRef;
+      if (!ThisFirstprivateIsLastprivate)
+        FirstPrivates.insert(OrigVD->getDeclName());
     }
   }
 
   const CapturedStmt *CS = D.getCapturedStmt(OMPD_parallel);
-  const RecordDecl *RD = CS->getCapturedRecordDecl();
-  auto I = CS->captures().begin();
-  for (FieldDecl *FD : RD->fields()) {
-    IdentifierInfo * info = I->getCapturedVar()->getIdentifier();
-    FD->dump();
-    if(isGlobal(info)) {
-      FD->setType(getAddrSpaceType(FD->getType(), LangAS::opencl_global));
-      std::cout << "global: " << info->getName().str() << "\n";
-    } else if(std::find(privates.begin(), privates.end(), info) == privates.end()){ // not private -> shared
-      FD->setType(getAddrSpaceType(FD->getType(), LangAS::opencl_local));
-      std::cout << "local: " << info->getName().str() << "\n";
+  int i = 0;
+  isShared.resize(CS->capture_size());
+  std::cout << "number of captures: " << CS->capture_size() << "\n";
+  for (auto capture : CS->captures()) {
+    DeclarationName name = capture.getCapturedVar()->getDeclName();
+    if (globals.count(name) + FirstPrivates.count(name)  == 0) { // not global, not private
+      isShared.set(i);
     }
-    ++I;
+    ++i;
   }
 
   std::cout << "emit parallel outlined function\n";
   bool wasAlreadyParallel = inParallel;
   inParallel = true;
-  OutlinedFunctionRAII RAII(*this, CGM, parallel);
+  OutlinedFunctionRAII RAII(*this, CGM);
   llvm::Value *OutlinedFn = CGOpenMPRuntime::emitParallelOutlinedFunction(D, ThreadIDVar, InnermostKind, CodeGen);
   inParallel = wasAlreadyParallel;
   if (auto Fn = dyn_cast<llvm::Function>(OutlinedFn)) {
@@ -492,8 +447,8 @@ void CGOpenMPRuntimeSPIR::emitParallelCall(CodeGenFunction &CGF, SourceLocation 
     return;
 
   llvm::SmallVector<llvm::Value *, 16> RealArgs;
-  RealArgs.push_back(llvm::ConstantPointerNull::get(CGF.CGM.Int32Ty->getPointerTo()));
-  RealArgs.push_back(llvm::ConstantPointerNull::get(CGF.CGM.Int32Ty->getPointerTo()));
+  RealArgs.push_back(llvm::ConstantPointerNull::get(CGF.CGM.Int32Ty->getPointerTo(CGM.getContext().getTargetAddressSpace(LangAS::opencl_generic))));
+  RealArgs.push_back(llvm::ConstantPointerNull::get(CGF.CGM.Int32Ty->getPointerTo(CGM.getContext().getTargetAddressSpace(LangAS::opencl_generic))));
   RealArgs.append(CapturedVars.begin(), CapturedVars.end());
 
   llvm::Function * F = cast<llvm::Function> (OutlinedFn);
@@ -508,14 +463,16 @@ void CGOpenMPRuntimeSPIR::emitParallelCall(CodeGenFunction &CGF, SourceLocation 
   //}
   llvm::DenseMap<llvm::Value *, llvm::GlobalVariable *> sharedVariables;
   bool emitBarrier = false;
-  for(int i = 0; i < F->getFunctionType()->getNumParams(); ++i) {
-    llvm::Type * paramType = F->getFunctionType()->getParamType(i);
-    unsigned addrSpaceLocal = CGM.getContext().getTargetAddressSpace(LangAS::opencl_local);
-    if(paramType->isPointerTy() && paramType->getPointerAddressSpace() == addrSpaceLocal) {
+  unsigned addrSpaceLocal = CGM.getContext().getTargetAddressSpace(LangAS::opencl_local);
+  unsigned addrSpaceGeneric = CGM.getContext().getTargetAddressSpace(LangAS::opencl_generic);
+  unsigned skip = F->getFunctionType()->getNumParams() - (unsigned) isShared.size();
+
+  for (unsigned i = skip; i < F->getFunctionType()->getNumParams(); ++i) { // emit global_tid and bound_tid ...
+    if (isShared.test(i-skip)) {
       // copy to scratchpad memory:
       // Create Global Variable with name <function name>.<variable name>
       // store arguments value in global variable and
-      // replace argument by pointer to global variable
+      // replace argument by pointer to global variable (casted to generic addrspace)
       llvm::PointerType * argType = cast<llvm::PointerType>(RealArgs[i]->getType());
       llvm::Value * arg = CGF.Builder.CreateAlignedLoad(RealArgs[i], CGM.getDataLayout().getPrefTypeAlignment(argType->getElementType()));
       const Twine &name = Twine(F->getName()) + Twine(".") + Twine(RealArgs[i]->getName());
@@ -523,17 +480,24 @@ void CGOpenMPRuntimeSPIR::emitParallelCall(CodeGenFunction &CGF, SourceLocation 
                                                                   llvm::Constant::getNullValue(arg->getType()), name, nullptr,
                                                                   llvm::GlobalVariable::NotThreadLocal, addrSpaceLocal);
       CGF.Builder.CreateAlignedStore(arg, sharedVarPtr, CGM.getDataLayout().getPrefTypeAlignment(arg->getType()));
+      llvm::Value * newArg = CGF.Builder.CreatePointerBitCastOrAddrSpaceCast(
+              sharedVarPtr, sharedVarPtr->getType()->getPointerElementType()->getPointerTo(addrSpaceGeneric));
       emitBarrier = true;
       sharedVariables[RealArgs[i]] = sharedVarPtr;
-      RealArgs[i] = sharedVarPtr;
+      RealArgs[i] = newArg;
     }
   }
+  isShared.clear();
   emitMasterFooter();
   // memory fence to wait for stores to local mem:
-  if(emitBarrier) {
-    emitBarrierCall(CGF, Loc, OpenMPDirectiveKind::OMPD_barrier, false, false);
+  if (emitBarrier) {
+    // call opencl write_mem_fence
+    llvm::Value * arg[] = { CGF.Builder.getInt32(1 << 0) }; //CLK_LOCAL_MEM_FENCE   0x01
+    CGF.EmitRuntimeCall(createRuntimeFunction(write_mem_fence), arg);
   }
-
+  for (llvm::Value * arg : RealArgs) {
+    arg->dump();
+  }
   // call outlined parallel function:
   CGF.EmitCallOrInvoke(OutlinedFn, RealArgs);
 
@@ -549,12 +513,14 @@ void CGOpenMPRuntimeSPIR::emitParallelCall(CodeGenFunction &CGF, SourceLocation 
     CGF.Builder.CreateAlignedStore(sharedVar, pair.first,
                                    CGM.getDataLayout().getPrefTypeAlignment(sharedVar->getType()));
   }
-  if(emitBarrier) {
-    emitBarrierCall(CGF, Loc, OpenMPDirectiveKind::OMPD_barrier, false, false);
+  if (emitBarrier) {
+    // call opencl read_mem_fence
+    llvm::Value * arg[] = { CGF.Builder.getInt32(1 << 0) }; //CLK_LOCAL_MEM_FENCE   0x01
+    CGF.EmitRuntimeCall(createRuntimeFunction(read_mem_fence), arg);
   }
-  if(inParallel) {
+  if (inParallel) {
     emitMasterFooter();
-  } else if(NumThreads) {
+  } else if (NumThreads) {
     emitNumThreadsFooter(CGF);
     NumThreads = nullptr;
   }
@@ -565,18 +531,8 @@ llvm::Value *CGOpenMPRuntimeSPIR::emitTeamsOutlinedFunction(
         const OMPExecutableDirective &D, const VarDecl *ThreadIDVar,
         OpenMPDirectiveKind InnermostKind, const RegionCodeGenTy &CodeGen) {
   std::cout << "emit teams outlined funtion\n";
-  const CapturedStmt *CS = D.getCapturedStmt(OMPD_teams);
-  const RecordDecl *RD = CS->getCapturedRecordDecl();
-  auto I = CS->captures().begin();
-//  if(isTargetTeams(D.getDirectiveKind())) std::cout << "is target teams\n";
-  for (FieldDecl *FD : RD->fields()) {
-    //if(!I->capturesVariableByCopy() || FD->getType()->isAnyPointerType())
-    if(isGlobal(I->getCapturedVar()->getIdentifier()))
-      FD->setType(getAddrSpaceType(FD->getType(), LangAS::opencl_global));
-    ++I;
-  }
 
-  OutlinedFunctionRAII RAII(*this, CGM, teams);
+  OutlinedFunctionRAII RAII(*this, CGM);
   class TeamsPrePostActionTy : public PrePostActionTy {
     CGOpenMPRuntimeSPIR &RT;
   public:
@@ -591,10 +547,9 @@ llvm::Value *CGOpenMPRuntimeSPIR::emitTeamsOutlinedFunction(
       std::cout << "teams footer emitted\n";
     }
   } Action(*this);
-  if(!teamsHasInnerOutlinedFunction(D.getDirectiveKind()))
+  if (!teamsHasInnerOutlinedFunction(D.getDirectiveKind()))
     CodeGen.setAction(Action);
- //   std::cout << "teams: no inner outlined function\n";
-  //}
+
   llvm::Value *OutlinedFn = CGOpenMPRuntime::emitTeamsOutlinedFunction(D, ThreadIDVar, InnermostKind, CodeGen);
   if (auto Fn = dyn_cast<llvm::Function>(OutlinedFn)) {
     Fn->removeFnAttr(llvm::Attribute::NoInline);
@@ -615,10 +570,9 @@ void CGOpenMPRuntimeSPIR::emitTeamsCall(CodeGenFunction &CGF,
     return;
 
   emitMasterFooter();
-
   llvm::SmallVector<llvm::Value *, 16> OutlinedFnArgs;
-  OutlinedFnArgs.push_back(llvm::ConstantPointerNull::get(CGF.CGM.Int32Ty->getPointerTo()));
-  OutlinedFnArgs.push_back(llvm::ConstantPointerNull::get(CGF.CGM.Int32Ty->getPointerTo()));
+  OutlinedFnArgs.push_back(llvm::ConstantPointerNull::get(CGF.CGM.Int32Ty->getPointerTo(CGM.getContext().getTargetAddressSpace(LangAS::opencl_generic))));
+  OutlinedFnArgs.push_back(llvm::ConstantPointerNull::get(CGF.CGM.Int32Ty->getPointerTo(CGM.getContext().getTargetAddressSpace(LangAS::opencl_generic))));
   OutlinedFnArgs.append(CapturedVars.begin(), CapturedVars.end());
   CGF.EmitCallOrInvoke(OutlinedFn, OutlinedFnArgs);
 }
@@ -653,9 +607,10 @@ CGOpenMPRuntimeSPIR::translateParameter(const FieldDecl *FD,
   if (const auto *Attr = FD->getAttr<OMPCaptureKindAttr>()) {
     if (Attr->getCaptureKind() == OMPC_map) {
       std::cout << "map attr:\n";
-      NativeParam->dump();
+      //NativeParam->dump();
     }
   }
+  return CGOpenMPRuntime::translateParameter(FD, NativeParam);
 }
 
 void CGOpenMPRuntimeSPIR::emitForStaticInit(CodeGenFunction &CGF, SourceLocation Loc,
@@ -670,8 +625,9 @@ void CGOpenMPRuntimeSPIR::emitForStaticInit(CodeGenFunction &CGF, SourceLocation
   // take lb
   llvm::Value * lb = CGF.EmitLoadOfScalar(LBLValue, Loc);
   // get int type from values:
-  llvm::Type * intType = lb->getType();
-  llvm::Value * one = CGF.Builder.getIntN(intType->getPrimitiveSizeInBits(),1);
+  llvm::Type * intType = CGF.Builder.getIntNTy(Values.IVSize);//lb->getType();
+  //std::cout << "intType is: " << intType->getPrimitiveSizeInBits() << ", while size says: " << Values.IVSize << "\n";
+  llvm::Value * one = CGF.Builder.getIntN(Values.IVSize /*intType->getPrimitiveSizeInBits()*/,1);
 
   llvm::Value * arg[] = { CGF.Builder.getInt32(0) };
   llvm::CallInst *local_size = CGF.EmitRuntimeCall(createRuntimeFunction(get_local_size), arg);
@@ -680,13 +636,13 @@ void CGOpenMPRuntimeSPIR::emitForStaticInit(CodeGenFunction &CGF, SourceLocation
   llvm::Value *it_space = CGF.Builder.CreateSub(ub, lb);
 
   llvm::Value * chunk = Values.Chunk;
-  if(chunk == nullptr) {
+  if (chunk == nullptr) {
     /** Static Scheduling:
      * When no chunk_size is specified, the iteration space is divided into chunks
      * that are approximately equal in size, and at most one chunk is distributed to
      * each thread. The size of the chunks is unspecified in this case.
      */
-    if(ScheduleKind.Schedule == OpenMPScheduleClauseKind::OMPC_SCHEDULE_static) {
+    if (ScheduleKind.Schedule == OpenMPScheduleClauseKind::OMPC_SCHEDULE_static) {
       // here we do: chunksize = (ub-lb+local_size)/local_size
       llvm::Value *it_space_rounded = CGF.Builder.CreateAdd(it_space, NumThreads);
       chunk = CGF.Builder.CreateSDiv(it_space_rounded, NumThreads);
@@ -703,7 +659,7 @@ void CGOpenMPRuntimeSPIR::emitForStaticInit(CodeGenFunction &CGF, SourceLocation
   llvm::Value * thread_iters = CGF.Builder.CreateSDiv(it_space, chunk);
   llvm::Value * last_iter = CGF.Builder.CreateURem(thread_iters, NumThreads);
   llvm::Value * last_iter_flag = CGF.Builder.CreateICmpEQ(last_iter, ltid_casted);
-  llvm::Value * last_iter_flag_casted = CGF.Builder.CreateSExtOrTrunc(last_iter_flag, intType);
+  llvm::Value * last_iter_flag_casted = CGF.Builder.CreateSExtOrTrunc(last_iter_flag, CGF.Builder.getInt32Ty());
   CGF.EmitStoreOfScalar(last_iter_flag_casted, ILLValue, true);
 
   // lower bound is: provided lb + localthreadID * chunksize
@@ -719,6 +675,7 @@ void CGOpenMPRuntimeSPIR::emitForStaticInit(CodeGenFunction &CGF, SourceLocation
   // stride is: local workgroup size * chunksize
   llvm::Value * stride = CGF.Builder.CreateMul(NumThreads, chunk);
   CGF.EmitStoreOfScalar(stride, STLValue, true);
+  return;
 }
 
 void CGOpenMPRuntimeSPIR::emitDistributeStaticInit(CodeGenFunction &CGF,
@@ -743,11 +700,11 @@ void CGOpenMPRuntimeSPIR::emitDistributeStaticInit(CodeGenFunction &CGF,
   llvm::Value *it_space = CGF.Builder.CreateSub(ub, lb);
 
   llvm::Value * chunk = Values.Chunk;
-  if(chunk == nullptr) {
+  if (chunk == nullptr) {
     // chunksize is unspecified: calculate a reasonable chunksize
     // chunksize should be multiple of local_size:
 
-    if(SchedKind == OpenMPDistScheduleClauseKind::OMPC_DIST_SCHEDULE_static) {
+    if (SchedKind == OpenMPDistScheduleClauseKind::OMPC_DIST_SCHEDULE_static) {
       /* 2.10.8 distribute construct - dist_schedule(static)
        * When no chunk_size is specified, the iteration space is divided
        * into chunks that are approximately equal in size,
@@ -780,7 +737,7 @@ void CGOpenMPRuntimeSPIR::emitDistributeStaticInit(CodeGenFunction &CGF,
   llvm::Value * group_iters = CGF.Builder.CreateSDiv(it_space, chunk);
   llvm::Value * last_iter = CGF.Builder.CreateURem(group_iters, num_groups_casted);
   llvm::Value * last_iter_flag = CGF.Builder.CreateICmpEQ(last_iter, gid_casted);
-  llvm::Value * last_iter_flag_casted = CGF.Builder.CreateSExtOrTrunc(last_iter_flag, intType);
+  llvm::Value * last_iter_flag_casted = CGF.Builder.CreateSExtOrTrunc(last_iter_flag, CGF.Builder.getInt32Ty());
   CGF.EmitStoreOfScalar(last_iter_flag_casted, ILLValue, true);
 
   // lower bound is: lb + groupID * chunksize
@@ -803,7 +760,7 @@ void CGOpenMPRuntimeSPIR::emitNumThreadsClause(CodeGenFunction &CGF,
                                            llvm::Value *NumThreads,
                                            SourceLocation Loc) {
   // only emit this clause if it is the outermost parallel construct
-  if(inParallel)
+  if (inParallel)
     return;
   std::cout << "emit num threads\n";
   // principle: if(thread_id < NumThreads) {...}
@@ -851,7 +808,7 @@ void CGOpenMPRuntimeSPIR::emitInlinedDirective(CodeGenFunction &CGF,
   if (!CGF.HaveInsertPoint())
     return;
   bool oldInParallel = inParallel; // should always be false?!
-  switch(InnerKind) {
+  switch (InnerKind) {
     case OpenMPDirectiveKind::OMPD_distribute_parallel_for:
     case OpenMPDirectiveKind::OMPD_distribute_parallel_for_simd:
     case OpenMPDirectiveKind::OMPD_distribute:
@@ -868,3 +825,17 @@ void CGOpenMPRuntimeSPIR::emitInlinedDirective(CodeGenFunction &CGF,
   }
   return;
 }
+
+Address
+CGOpenMPRuntimeSPIR::getParameterAddress(CodeGenFunction &CGF,
+                                          const VarDecl *NativeParam,
+                                          const VarDecl *TargetParam) const {
+  std::cout << "getParameterAddress\n";
+  //NativeParam->dump();
+  //TargetParam->dump();
+  return CGF.GetAddrOfLocalVar(NativeParam);
+}
+
+void CGOpenMPRuntimeSPIR::createOffloadEntry(llvm::Constant *ID,
+                                         llvm::Constant *Addr, uint64_t Size,
+                                         int32_t Flags) {}

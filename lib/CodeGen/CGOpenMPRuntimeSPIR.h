@@ -15,6 +15,7 @@
 #ifndef LLVM_CLANG_LIB_CODEGEN_CGOPENMPRUNTIMESPIR_H
 #define LLVM_CLANG_LIB_CODEGEN_CGOPENMPRUNTIMESPIR_H
 
+#include <llvm/ADT/SmallBitVector.h>
 #include "CGOpenMPRuntime.h"
 #include "CodeGenFunction.h"
 #include "clang/Basic/IdentifierTable.h"
@@ -29,12 +30,6 @@ class CGOpenMPRuntimeSPIR : public CGOpenMPRuntime {
 public:
   llvm::BasicBlock * MasterContBlock;
 
-  enum AllocaAddrSpace {
-    parallel = 0,
-    target = LangAS::opencl_global,
-    teams = LangAS::opencl_local
-  };
-
 protected:
   enum OpenMPRTLFunctionSPIR {
     get_global_id,
@@ -42,12 +37,14 @@ protected:
     get_local_size,
     get_num_groups,
     get_group_id,
-    work_group_barrier
+    work_group_barrier,
+    mem_fence,
+    read_mem_fence,
+    write_mem_fence
   };
   // TODO: comment these functions!
-  QualType getAddrSpaceType(QualType T, LangAS::ID AddrSpace);
-  bool isGlobal(IdentifierInfo * info);
-  SmallVector<IdentifierInfo *, 16> captures;
+  llvm::DenseSet<DeclarationName> globals;
+  llvm::SmallBitVector isShared;
   llvm::BasicBlock * NumThreadsContBlock;
   CodeGenFunction * currentCGF;
   llvm::Value * NumThreads;
@@ -55,12 +52,17 @@ protected:
   void emitMasterFooter();
   void emitNumThreadsHeader(CodeGenFunction &CGF, llvm::Value *NumThreads);
   void emitNumThreadsFooter(CodeGenFunction &CGF);
-  void GenOpenCLArgMetadata(const RecordDecl *FD, llvm::Function *Fn, llvm::LLVMContext &Context, CGBuilderTy &Builder);
+  void GenOpenCLArgMetadata(const RecordDecl *FD, llvm::Function *Fn, CodeGenModule &CGM);
   llvm::Constant *createRuntimeFunction(OpenMPRTLFunctionSPIR Function);
   bool isTargetParallel;
   bool inParallel;
   bool targetHasInnerOutlinedFunction(OpenMPDirectiveKind kind);
   bool teamsHasInnerOutlinedFunction(OpenMPDirectiveKind kind);
+
+  /// \brief Creates offloading entry for the provided entry ID \a ID,
+  /// address \a Addr, size \a Size, and flags \a Flags.
+  virtual void createOffloadEntry(llvm::Constant *ID, llvm::Constant *Addr,
+                                  uint64_t Size, int32_t Flags = 0);
 
 public:
   explicit CGOpenMPRuntimeSPIR(CodeGenModule &CGM);
@@ -255,6 +257,15 @@ public:
                                     OpenMPDirectiveKind InnermostKind,
                                     const RegionCodeGenTy &CodeGen,
                                     bool HasCancel = false);
+
+  /// Gets the address of the native argument basing on the address of the
+  /// target-specific parameter.
+  /// \param NativeParam Parameter itself.
+  /// \param TargetParam Corresponding target-specific parameter.
+  virtual Address getParameterAddress(CodeGenFunction &CGF,
+                                      const VarDecl *NativeParam,
+                                      const VarDecl *TargetParam) const;
+
 };
 
 } // CodeGen namespace.
