@@ -28,7 +28,9 @@ namespace CodeGen {
 class CGOpenMPRuntimeSPIR : public CGOpenMPRuntime {
 
 public:
+  // Fixme: should be private
   llvm::BasicBlock * MasterContBlock;
+  CodeGenFunction * currentCGF;
 
 protected:
   enum OpenMPRTLFunctionSPIR {
@@ -46,7 +48,6 @@ protected:
   llvm::DenseSet<DeclarationName> globals;
   llvm::SmallBitVector isShared;
   llvm::BasicBlock * NumThreadsContBlock;
-  CodeGenFunction * currentCGF;
   llvm::Value * NumThreads;
   void emitMasterHeader(CodeGenFunction &CGF);
   void emitMasterFooter();
@@ -154,13 +155,6 @@ public:
                                bool EmitChecks = true,
                                bool ForceSimpleCall = false);
 
-  /// Translates the native parameter of outlined function if this is required
-  /// for target.
-  /// \param FD Field decl from captured record for the paramater.
-  /// \param NativeParam Parameter itself.
-  const VarDecl *translateParameter(const FieldDecl *FD,
-                                    const VarDecl *NativeParam) const override;
-
   /// \brief Call the appropriate runtime routine to initialize it before start
   /// of loop.
   ///
@@ -257,14 +251,6 @@ public:
                                     OpenMPDirectiveKind InnermostKind,
                                     const RegionCodeGenTy &CodeGen,
                                     bool HasCancel = false);
-
-  /// Gets the address of the native argument basing on the address of the
-  /// target-specific parameter.
-  /// \param NativeParam Parameter itself.
-  /// \param TargetParam Corresponding target-specific parameter.
-  virtual Address getParameterAddress(CodeGenFunction &CGF,
-                                      const VarDecl *NativeParam,
-                                      const VarDecl *TargetParam) const;
 
 };
 
