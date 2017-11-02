@@ -2406,6 +2406,14 @@ static void ParseLangArgs(LangOptions &Opts, ArgList &Args, InputKind IK,
     Opts.Exceptions = 0;
     Opts.CXXExceptions = 0;
   }
+  if (Opts.OpenMPIsDevice &&
+          (T.getArch() == llvm::Triple::spir64
+           || T.getArch() == llvm::Triple::spir)) {
+    Opts.Exceptions = 0;
+    Opts.CXXExceptions = 0;
+    Opts.NoBuiltin = 1;
+    Opts.Freestanding = 1;
+  }
 
   // Get the OpenMP target triples if any.
   if (Arg *A = Args.getLastArg(options::OPT_fopenmp_targets_EQ)) {

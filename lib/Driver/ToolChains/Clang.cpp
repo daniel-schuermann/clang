@@ -2259,7 +2259,9 @@ static void RenderSSPOptions(const ToolChain &TC, const ArgList &Args,
 
   // NVPTX doesn't support stack protectors; from the compiler's perspective, it
   // doesn't even have a stack!
-  if (EffectiveTriple.isNVPTX())
+  if (EffectiveTriple.isNVPTX() ||
+          EffectiveTriple.getArch() == llvm::Triple::spir ||
+          EffectiveTriple.getArch() == llvm::Triple::spir64)
     return;
 
   // -stack-protector=0 is default.
