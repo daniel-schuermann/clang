@@ -13,7 +13,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "CGOpenMPRuntimeSPIR.h"
-#include <iostream>
 
 using namespace clang;
 using namespace CodeGen;
@@ -52,6 +51,18 @@ CGOpenMPRuntimeSPIR::CGOpenMPRuntimeSPIR(CodeGenModule &CGM)
   std::cout << "using SPIR-V\n";
   if (!CGM.getLangOpts().OpenMPIsDevice)
     llvm_unreachable("OpenMP SPIR can only handle device code.");
+
+
+  CodeGenFunction CGF(CGM);
+  llvm::LLVMContext &Context = CGM.getLLVMContext();
+  CGBuilderTy Builder = CGF.Builder;
+  SmallVector<llvm::Metadata *, 8> opSource = {
+          llvm::ConstantAsMetadata::get(Builder.getInt32(3)), // OpenCL C
+          //llvm::ConstantAsMetadata::get(Builder.getInt32(201000))}; // OpenCL C Version
+          llvm::ConstantAsMetadata::get(Builder.getInt32(200000))}; // OpenCL C Version
+
+llvm::MDNode * srcMD = llvm::MDNode::get(Context, opSource);
+  CGM.getModule().getOrInsertNamedMetadata("spirv.Source")->addOperand(srcMD);
 }
 
 llvm::Constant * CGOpenMPRuntimeSPIR::createRuntimeFunction(OpenMPRTLFunctionSPIR Function) {
@@ -169,17 +180,7 @@ bool CGOpenMPRuntimeSPIR::teamsHasInnerOutlinedFunction(OpenMPDirectiveKind kind
       return false;
   }
 }
-/*
-static unsigned ArgInfoAddressSpace(unsigned LangAS) {
-  switch (LangAS) {
-    case LangAS::opencl_global:   return 1;
-    case LangAS::opencl_constant: return 2;
-    case LangAS::opencl_local:    return 3;
-    case LangAS::opencl_generic:  return 4; // Not in SPIR 2.0 specs.
-    default:
-      return 0; // Assume private.
-  }
-}*/
+
 
 // TODO clean up unnecessary code
 void CGOpenMPRuntimeSPIR::GenOpenCLArgMetadata(const RecordDecl *FD, llvm::Function *Fn,
@@ -187,11 +188,7 @@ void CGOpenMPRuntimeSPIR::GenOpenCLArgMetadata(const RecordDecl *FD, llvm::Funct
   CodeGenFunction CGF(CGM);
   llvm::LLVMContext &Context = CGM.getLLVMContext();
   CGBuilderTy Builder = CGF.Builder;
-  SmallVector<llvm::Metadata *, 8> opSource = {
-          llvm::ConstantAsMetadata::get(Builder.getInt32(3)), // OpenCL C
-          llvm::ConstantAsMetadata::get(Builder.getInt32(10000))}; // OpenCL C Version
-  llvm::MDNode * srcMD = llvm::MDNode::get(Context, opSource);
-  Fn->getParent()->getOrInsertNamedMetadata("spirv.Source")->addOperand(srcMD);
+
   // Create MDNodes that represent the kernel arg metadata.
   // Each MDNode is a list in the form of "key", N number of values which is
   // the same number of values as their are kernel arguments.
@@ -486,9 +483,8 @@ void CGOpenMPRuntimeSPIR::emitParallelCall(CodeGenFunction &CGF, SourceLocation 
   emitMasterFooter();
   // memory fence to wait for stores to local mem:
   if (emitBarrier) {
-    // call opencl write_mem_fence
     llvm::Value * arg[] = { CGF.Builder.getInt32(1 << 0) }; //CLK_LOCAL_MEM_FENCE   0x01
-    CGF.EmitRuntimeCall(createRuntimeFunction(write_mem_fence), arg);
+    CGF.EmitRuntimeCall(createRuntimeFunction(work_group_barrier), arg);
   }
   for (llvm::Value * arg : RealArgs) {
     //arg->dump();
@@ -509,9 +505,8 @@ void CGOpenMPRuntimeSPIR::emitParallelCall(CodeGenFunction &CGF, SourceLocation 
                                    CGM.getDataLayout().getPrefTypeAlignment(sharedVar->getType()));
   }
   if (emitBarrier) {
-    // call opencl read_mem_fence
     llvm::Value * arg[] = { CGF.Builder.getInt32(1 << 0) }; //CLK_LOCAL_MEM_FENCE   0x01
-    CGF.EmitRuntimeCall(createRuntimeFunction(read_mem_fence), arg);
+    CGF.EmitRuntimeCall(createRuntimeFunction(work_group_barrier), arg);
   }
   if (inParallel) {
     emitMasterFooter();

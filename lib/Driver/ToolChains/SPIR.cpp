@@ -21,7 +21,7 @@ using namespace clang;
 using namespace llvm::opt;
 
 spir::Linker::Linker(const ToolChain &TC)
-        : GnuTool("spir::Linker", "cp", TC) {}
+        : GnuTool("spir::Linker", "spirv-link", TC) {}
 
 bool spir::Linker::isLinkJob() const {
   return true;
@@ -40,10 +40,10 @@ void spir::Linker::ConstructJob(Compilation &C, const JobAction &JA,
 
   std::string Linker = getToolChain().GetProgramPath(getShortName());
   ArgStringList CmdArgs;
-  //CmdArgs.push_back("-r");
+  //CmdArgs.push_back("--target-env=opencl2.1");
   AddLinkerInputs(getToolChain(), Inputs, Args, CmdArgs, JA);
 
-  //CmdArgs.push_back("-o");
+  CmdArgs.push_back("-o");
   CmdArgs.push_back(Output.getFilename());
   C.addCommand(llvm::make_unique<Command>(JA, *this, Args.MakeArgString(Linker),
                                           CmdArgs, Inputs));

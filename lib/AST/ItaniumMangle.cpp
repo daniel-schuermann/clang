@@ -595,6 +595,12 @@ bool ItaniumMangleContextImpl::shouldMangleCXXName(const NamedDecl *D) {
     if (!FD->getDeclName().isIdentifier() || L == CXXLanguageLinkage)
       return true;
 
+    if (FD->isExternC() && getASTContext().getLangOpts().OpenMPIsDevice &&
+        (getASTContext().getTargetInfo().getTriple().getArch() == llvm::Triple::spir ||
+         getASTContext().getTargetInfo().getTriple().getArch() == llvm::Triple::spir64)) {
+      return true;
+    }
+
     // C functions are not mangled.
     if (L == CLanguageLinkage)
       return false;

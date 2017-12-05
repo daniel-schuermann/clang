@@ -61,6 +61,7 @@ public:
       AddrSpaceMap = &SPIRAddrSpaceMap;
     } else {
       AddrSpaceMap = &SPIROpenMPAddrSpaceMap;
+      TheCXXABI.set(TargetCXXABI::GenericItanium);
     }
     UseAddrSpaceMapMangling = true;
     // Define available target features
