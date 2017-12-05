@@ -54,7 +54,6 @@ namespace toolchains {
         bool isPICDefaultForced() const override { return false; };
 
         bool hasBlocksRuntime() const override { return false; };
-        bool SupportsObjCGC() const override { return false; };
         bool SupportsProfiling() const override { return false; };
 
     protected:

@@ -13,6 +13,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "CGOpenMPRuntimeSPIR.h"
+#include <iostream>
 
 using namespace clang;
 using namespace CodeGen;
